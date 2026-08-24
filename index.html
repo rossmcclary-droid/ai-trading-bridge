@@ -88,20 +88,20 @@
         <section class="card top3-card" id="top3Section">
           <div class="card-head">
             <div>
-              <div class="eyebrow">RANKED SCAN RESULTS</div>
+              <div class="eyebrow">CHATGPT STRATEGY RESULTS</div>
               <h2>Top 3 Trade Setups</h2>
             </div>
             <span class="pill neutral" id="top3Status">Run scan</span>
           </div>
           <div id="top3List" class="top3-list">
-            <div class="proposal-empty">Tap <b>Scan Everything</b> to rank the three strongest setups on this account.</div>
+            <div class="proposal-empty">Your linked ChatGPT trading conversation supplies the Top 3 proposals after it reviews a scan.</div>
           </div>
         </section>
 
         <section class="card proposal-card">
           <div class="card-head">
             <div>
-              <div class="eyebrow">AI TRADE PROPOSAL</div>
+              <div class="eyebrow">CHATGPT TRADE PROPOSAL</div>
               <h2 id="proposalHeadline">Waiting for scan</h2>
             </div>
             <select id="executionMode" aria-label="Execution mode">
@@ -110,7 +110,7 @@
               <option>Auto-Execution Mode</option>
             </select>
           </div>
-          <div id="proposalBody" class="proposal-empty">Select a symbol or scan the broker watchlist.</div>
+          <div id="proposalBody" class="proposal-empty">Waiting for a proposal from your linked ChatGPT trading conversation.</div>
           <div class="proposal-actions">
             <button id="expBtn" class="secondary">EXP</button>
             <button id="appBtn" class="success">APP</button>
@@ -131,19 +131,19 @@
             <div class="risk-row"><span>Connector type</span><strong>MCP / ChatGPT App</strong></div>
             <div class="risk-row"><span>Local endpoint</span><strong>/mcp</strong></div>
             <div class="risk-row"><span>Execution</span><strong>SIMULATED ONLY</strong></div>
-            <div class="risk-row"><span>Conversation</span><strong>Your existing ChatGPT chat</strong></div>
+            <div class="risk-row"><span>Strategy source</span><strong>Your existing ChatGPT trading conversation</strong></div>
           </div>
           <div class="link-actions">
             <button id="testConnectorBtn" class="primary">Test Connector</button>
             <button id="showToolsBtn" class="secondary">Show Tools</button>
           </div>
-          <div id="conversationNote" class="bridge-note">In a supported ChatGPT plan, add this server as a custom app/MCP connector. Then your existing conversation can call tools such as <b>scan_everything</b> without moving its saved context into a new chat.</div>
+          <div id="conversationNote" class="bridge-note">In a supported ChatGPT plan, add this server as a custom app/MCP connector. Then your existing conversation calls <b>scan_everything</b>, applies the trading rules already stored in that chat, and submits its own Top 3 with <b>submit_trade_proposals</b>. The bridge never invents the trade explanation.</div>
         </section>
 
         <section class="card">
           <div class="card-head">
-            <div><div class="eyebrow">AI ASSISTANT</div><h2>Conversation Relay</h2></div>
-            <span class="pill neutral">Demo AI</span>
+            <div><div class="eyebrow">STRATEGY STATUS</div><h2>ChatGPT Conversation Relay</h2></div>
+            <span class="pill neutral">External AI</span>
           </div>
           <div id="chatLog" class="chat-log"></div>
           <form id="chatForm" class="chat-form">

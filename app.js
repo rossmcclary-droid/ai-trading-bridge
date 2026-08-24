@@ -121,3 +121,55 @@ if($('closeBrokerDialog'))$('closeBrokerDialog').onclick=()=>$('brokerDialog').c
 if($('tlConnectForm'))$('tlConnectForm').onsubmit=async e=>{e.preventDefault();showBrokerStatus('Connecting to TradeLocker…');const f=Object.fromEntries(new FormData(e.target).entries());try{const r=await fetch('/api/connect/tradelocker',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(f)});const j=await r.json();if(!r.ok)throw new Error(j.detail||'Connection failed');showBrokerStatus('TradeLocker connected. Accounts discovered and stored securely.');await syncBackendAccounts()}catch(err){showBrokerStatus(err.message,false)}};
 if($('mt5ConnectForm'))$('mt5ConnectForm').onsubmit=async e=>{e.preventDefault();showBrokerStatus('Connecting to MetaTrader 5…');const f=Object.fromEntries(new FormData(e.target).entries());f.environment='DEMO';try{const r=await fetch('/api/connect/mt5',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(f)});const j=await r.json();if(!r.ok)throw new Error(j.detail||'Connection failed');showBrokerStatus('MetaTrader 5 connected. Account discovered.');await syncBackendAccounts()}catch(err){showBrokerStatus(err.message,false)}};
 loadAccount();syncBackendAccounts();renderConversationStatus();addChat('ai','App ready. Connect a TradeLocker demo account or an MT5 terminal, select the exact account, then use Scan Everything to rank the top three setups. The MCP endpoint exposes the same tools for ChatGPT integration.');
+
+
+// v1.2: ChatGPT-strategy-source workflow. The bridge collects data; it does not choose trades.
+function normalizeStrategyProposal(p){return{symbol:p.symbol,dir:p.direction==='BUY'?'LONG':'SHORT',score:Number(p.score||0),entry:Number(p.entry),stop:Number(p.safeLoss),tp1:Number(p.takeProfit1),tp2:Number(p.takeProfit2),risk:Number(p.riskPercent||0.5),proposalId:p.proposalId,source:p.source||'CHATGPT_STRATEGY',conversationLabel:p.conversationLabel||'Existing ChatGPT trading conversation',conversationReference:p.conversationReference||'',explanation:p.explanation||'',rank:p.rank||0}}
+normalizeBackendProposal=function(row){return normalizeStrategyProposal(row.proposal||row)};
+
+async function refreshStrategyProposals(scroll=false){
+  try{
+    const r=await fetch('/api/strategy/proposals?account_id='+encodeURIComponent(state.account.id));
+    if(!r.ok)throw new Error('strategy proposals unavailable');
+    const data=await r.json();
+    state.top3=(data.proposals||[]).map(p=>({symbol:p.symbol,proposal:p,normalized:normalizeStrategyProposal(p)}));
+    renderTop3();
+    if(state.top3.length){
+      const p=state.top3[0].normalized; state.proposal=p;
+      let s=state.account.symbols.find(x=>x[0]===p.symbol)||[p.symbol,'Broker',p.entry]; state.symbol=s;
+      try{const cr=await fetch('/api/chart/'+encodeURIComponent(p.symbol)+'?account_id='+encodeURIComponent(state.account.id));if(cr.ok){const cj=await cr.json();state.series={'4h':cj.bundle['4H'],'1h':cj.bundle['1H'],'15m':cj.bundle['15M'],'5m':cj.bundle['5M']};}}catch(e){}
+      $('symbolTitle').textContent=p.symbol;$('priceTitle').textContent=fmt(p.entry,p.symbol);renderProposal();drawAll();
+      if(scroll)$('top3Section')?.scrollIntoView({behavior:'smooth',block:'start'});
+      addActivity(`Loaded ${state.top3.length} proposal(s) from ChatGPT strategy conversation.`,'success');
+    } else {
+      $('top3Status').textContent='Awaiting ChatGPT';
+    }
+  }catch(e){addActivity('Could not refresh ChatGPT strategy proposals.','warn')}
+}
+
+renderTop3=function(){const box=$('top3List'),status=$('top3Status');if(!state.top3.length){box.innerHTML='<div class="proposal-empty"><b>Waiting for your ChatGPT trading conversation.</b><br><br>Tell that conversation “scan everything.” It will use the bridge data, apply the rules it already knows, and submit its own Top 3 here.</div>';status.textContent='Awaiting ChatGPT';return}status.textContent=`${state.top3.length} from ChatGPT`;box.innerHTML=state.top3.map((item,i)=>{const p=item.normalized||normalizeBackendProposal(item);const cls=p.dir==='LONG'?'positive':'negative';return `<article class="rank-card"><div class="rank-number">#${p.rank||i+1}</div><div class="rank-main"><div class="rank-title"><strong>${p.symbol}</strong><span class="${cls}">${p.dir}</span><span class="score-chip">${p.score}%</span></div><div class="rank-route">${state.account.broker} · Account ${state.account.accountNumber}<br><small>Proposed by: ${p.conversationLabel}</small></div><div class="rank-levels"><span>Entry <b>${fmt(p.entry,p.symbol)}</b></span><span>SL <b>${fmt(p.stop,p.symbol)}</b></span><span>TP1 <b>${fmt(p.tp1,p.symbol)}</b></span><span>TP2 <b>${fmt(p.tp2,p.symbol)}</b></span></div><div class="rank-actions"><button class="secondary" data-rank="${i}" data-action="exp">EXP</button><button class="success" data-rank="${i}" data-action="app">APP</button><button class="accent" data-rank="${i}" data-action="expapp">EXP + APP</button><button class="danger" data-rank="${i}" data-action="reject">REJECT</button></div></div></article>`}).join('');box.querySelectorAll('button[data-rank]').forEach(btn=>btn.onclick=()=>openRankedProposal(Number(btn.dataset.rank),btn.dataset.action))};
+
+renderProposal=function(){const p=state.proposal;if(!p||p.source!=='CHATGPT_STRATEGY'){$('proposalHeadline').textContent='Waiting for ChatGPT strategy';$('proposalBody').innerHTML='<div class="proposal-empty">No locally generated trade can be approved. Your linked ChatGPT trading conversation must submit the proposal first.</div>';$('explanation').classList.add('hidden');return}$('proposalHeadline').textContent=`${p.symbol} · ${p.dir} · ${p.score}%`;$('proposalBody').innerHTML=`<div class="proposal-route">Route: <strong>${state.account.broker} · Account ${state.account.accountNumber}</strong><br>Strategy: <strong>${p.conversationLabel}</strong></div><div class="trade-grid"><div class="trade-field"><span>Entry</span><strong>${fmt(p.entry,p.symbol)}</strong></div><div class="trade-field"><span>Safe Loss</span><strong>${fmt(p.stop,p.symbol)}</strong></div><div class="trade-field"><span>Take Profit 1</span><strong>${fmt(p.tp1,p.symbol)}</strong></div><div class="trade-field"><span>Take Profit 2</span><strong>${fmt(p.tp2,p.symbol)}</strong></div></div><div class="trade-grid"><div class="trade-field"><span>Risk</span><strong>${p.risk.toFixed(2)}%</strong></div><div class="trade-field"><span>Order Qty / Volume</span><input id="tradeQty" type="number" min="0.01" step="0.01" value="1" style="width:90px"></div><div class="trade-field"><span>Execution</span><strong>Pending approval</strong></div><div class="trade-field"><span>Source</span><strong>ChatGPT strategy conversation</strong></div></div>`;$('explanation').classList.add('hidden')};
+
+explain=function(){const p=state.proposal;if(!p||p.source!=='CHATGPT_STRATEGY'){addChat('ai','There is no ChatGPT-originated proposal to explain yet.');return}$('explanation').classList.remove('hidden');$('explanation').innerHTML=p.explanation?`<strong>Why this trade — from ${p.conversationLabel}</strong><br><br>${p.explanation.replace(/\n/g,'<br>')}`:`<strong>Explanation pending from ${p.conversationLabel}</strong><br><br>The Trading Bridge will not generate a substitute explanation. Ask the linked ChatGPT conversation to provide the reasoning for proposal <code>${p.proposalId}</code>.`;addActivity(`EXP opened for ${p.symbol}; source=${p.conversationLabel}.`)};
+
+scan=async function(){
+  $('scanBtn').disabled=true;$('scanBtn').textContent='Collecting market data…';if($('mobileScanBtn')){$('mobileScanBtn').disabled=true;$('mobileScanBtn').textContent='Collecting…'}
+  try{
+    const r=await fetch('/api/scan',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({account_id:state.account.id,max_symbols:40})});const data=await r.json();if(!r.ok)throw new Error(data.detail||'scan failed');
+    state.scanResults=data.results||[];state.top3=[];state.proposal=null;renderTop3();renderProposal();
+    $('top3Status').textContent='Awaiting ChatGPT';
+    addChat('ai',`Market data collected for ${data.account.platform} account ${data.account.account_number||data.account.accountNumber}: ${data.symbolsScanned} symbols × 4 timeframes. Scan session ${data.scanSessionId}. The bridge did not choose a trade. Your linked ChatGPT trading conversation must now rank and submit the Top 3.`);
+    addActivity(`Scan session ${data.scanSessionId} ready for ChatGPT strategy.`,'success');
+  }catch(e){addChat('ai','Scan failed: '+e.message);addActivity('Scan failed: '+e.message,'warn')}
+  finally{$('scanBtn').disabled=false;$('scanBtn').textContent='Scan Everything';if($('mobileScanBtn')){$('mobileScanBtn').disabled=false;$('mobileScanBtn').textContent='Scan Everything'}}
+};
+
+// Rebind controls after replacing the workflow functions.
+$('scanBtn').onclick=scan;$('expBtn').onclick=explain;$('appBtn').onclick=()=>approve(false);$('expAppBtn').onclick=()=>approve(true);
+if($('mobileScanBtn'))$('mobileScanBtn').onclick=scan;
+if($('mobileTop3Btn'))$('mobileTop3Btn').onclick=()=>refreshStrategyProposals(true);
+// Refresh proposals submitted by ChatGPT every 8 seconds while the app is open.
+setInterval(()=>refreshStrategyProposals(false),8000);
+refreshStrategyProposals(false);
+addChat('ai','v1.2 strategy mode: this bridge no longer chooses or explains trades. Your linked ChatGPT trading conversation is the only strategy source.');

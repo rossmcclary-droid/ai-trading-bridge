@@ -1,13 +1,16 @@
-# AI Trading Bridge v1.0
+# AI Trading Bridge v1.2
 
-A mobile-first PWA + FastAPI backend for connecting TradeLocker or MetaTrader 5 accounts, scanning broker instruments on 4H / 1H / 15M / 5M, ranking the top 3 setups, and routing approved trades through a guarded broker execution layer.
+A mobile-first PWA + FastAPI/MCP bridge for TradeLocker and MetaTrader 5. The bridge collects 4H / 1H / 15M / 5M candles, volume and RSI, but the linked ChatGPT trading conversation is the strategy source: it ranks the Top 3, submits the trade proposals, and supplies the explanations.
 
-## What is real in v1.0
+## What is real in v1.2
 
 - Persistent SQLite database for connections, exact broker accounts, alerts, proposals and audit events.
 - TradeLocker JWT login, account discovery, broker instrument discovery, historical candle retrieval, positions/orders access and order placement adapter.
 - MetaTrader 5 Python adapter for account login, Market Watch symbols, candle retrieval, positions/orders and market order sending. The MT5 backend must run on Windows with the MetaTrader 5 terminal installed.
-- RSI(14), volume, four-timeframe scanning and top-3 ranking.
+- RSI(14), volume and four-timeframe market-data collection.
+- ChatGPT-strategy proposal inbox: only proposals submitted through `submit_trade_proposals` are approvable.
+- Explanations are stored from the ChatGPT strategy conversation; the bridge does not fabricate replacement reasoning.
+- Top 3 UI refreshes from the latest ChatGPT strategy submission.
 - Mobile PWA with exact active platform/account number, top-3 proposals, EXP / APP / EXP+APP / REJECT workflow and broker connection forms.
 - MCP endpoint at `/mcp` plus tool catalog at `/mcp-tools` so the same backend can be exposed to ChatGPT as a custom app when the account/product supports it.
 - Encrypted broker credential storage and an audit log.
@@ -103,8 +106,20 @@ The desired flow is: existing ChatGPT conversation → `scan_everything` → top
 
 ## Important v1 limitations
 
-- The scanner/ranking algorithm is intentionally simple and deterministic; it is infrastructure, not a claim of trading edge.
+- The bridge may include a technical-screen snapshot in scan output to help the AI inspect data, but it does not convert that snapshot into an approvable trade. The linked ChatGPT strategy conversation must make the trading decision.
 - Automated lot/quantity sizing is not enabled because contract sizes, lot steps, tick values and broker rules vary. Approval requires an explicit quantity/volume.
 - The MT5 v1 adapter sends market orders only. Pending-order support can be added after validating the broker's filling/time policies.
 - Alerts are persisted but a background alert scheduler is not yet included.
 - For a public internet deployment, add authentication for the web UI/API, HTTPS, rate limiting and a production secret manager before exposing it.
+
+
+## v1.2 strategy workflow
+
+1. The linked ChatGPT conversation calls `scan_everything`.
+2. The bridge returns a `scanSessionId` plus broker/account identity and all requested timeframe data.
+3. ChatGPT applies the trading rules and context already present in that conversation.
+4. ChatGPT calls `submit_trade_proposals` with up to three ranked trades and its explanation for each.
+5. The phone app displays those exact proposals. `EXP` reveals the stored ChatGPT explanation.
+6. `APP` / `EXP + APP` can only approve a proposal whose `source` is `CHATGPT_STRATEGY`; server risk/execution locks still apply.
+
+Important product limitation: the web app cannot inject a message into an arbitrary consumer ChatGPT conversation by itself. The existing ChatGPT conversation must have the Trading Bridge connected as a supported custom app/MCP tool and invoke these tools from that conversation.

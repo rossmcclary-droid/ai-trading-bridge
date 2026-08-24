@@ -42,7 +42,7 @@ def _fernet() -> Fernet:
     return Fernet(seed)
 
 FERNET = _fernet()
-app = FastAPI(title="AI Trading Bridge", version="1.0.0")
+app = FastAPI(title="AI Trading Bridge", version="1.2.0")
 
 TIMEFRAMES = {"4H": "4H", "1H": "1H", "15M": "15m", "5M": "5m"}
 TF_SECONDS = {"4H": 14400, "1H": 3600, "15M": 900, "5M": 300}
@@ -74,6 +74,12 @@ def db_init() -> None:
         CREATE TABLE IF NOT EXISTS audit(
           id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, action TEXT NOT NULL,
           account_id TEXT, details_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS scan_sessions(
+          id TEXT PRIMARY KEY, account_id TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS strategy_state(
+          key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at TEXT NOT NULL
         );
         """)
 
@@ -372,30 +378,56 @@ def score(bundle: dict[str,list[dict[str,Any]]]) -> dict[str,Any]:
     return {"direction":direction,"score":s,"rsis":rsis,"volumeRatio15m":round(v15/max(vavg,1),2)}
 
 
-def proposal(account: dict[str,Any], instrument: dict[str,Any], bundle: dict[str,list[dict[str,Any]]]) -> dict[str,Any]:
-    ev=score(bundle); entry=bundle["5M"][-1]["c"]; candles=bundle["15M"][-14:]
-    atr=sum(x["h"]-x["l"] for x in candles)/max(1,len(candles)); unit=max(atr,abs(entry)*.001)
-    buy=ev["direction"]=="BUY"; sl=entry-unit*1.5 if buy else entry+unit*1.5; tp1=entry+unit*1.6 if buy else entry-unit*1.6; tp2=entry+unit*2.8 if buy else entry-unit*2.8
-    return {"proposalId":str(uuid.uuid4()),"accountId":account["id"],"platform":account["platform"],"accountNumber":account["account_number"],"symbol":instrument["symbol"],"instrument":{k:v for k,v in instrument.items() if k!="raw"},"direction":ev["direction"],"entry":entry,"safeLoss":sl,"takeProfit1":tp1,"takeProfit2":tp2,"riskPercent":0.5,"score":ev["score"],"evidence":ev,"status":"AWAITING_APPROVAL"}
-
-
-def save_proposal(p: dict[str,Any]) -> None:
-    with sqlite3.connect(DB_PATH) as c:
-        c.execute("INSERT OR REPLACE INTO proposals(id,account_id,payload_json,status,created_at) VALUES(?,?,?,?,?)",(p["proposalId"],p["accountId"],json.dumps(p),p["status"],utcnow()))
-
-
 def scan(account: dict[str,Any], max_symbols: int=40) -> dict[str,Any]:
+    """Collect broker data only. The Trading Bridge does not choose trades.
+    The linked ChatGPT strategy conversation consumes this scan and submits proposals separately.
+    """
     inst=instruments_for(account)[:max_symbols]; results=[]
     for x in inst:
         try:
-            b=bundle_for(account,x); p=proposal(account,x,b); save_proposal(p)
-            results.append({"symbol":x["symbol"],"direction":p["direction"],"score":p["score"],"proposal":p,"timeframes":{tf:{"lastClose":b[tf][-1]["c"],"rsi14":b[tf][-1]["rsi"],"lastVolume":b[tf][-1]["v"],"last12Candles":b[tf][-12:]} for tf in TIMEFRAMES}})
+            b=bundle_for(account,x); ev=score(b)
+            results.append({
+                "symbol":x["symbol"],
+                "instrument":{k:v for k,v in x.items() if k!="raw"},
+                "technicalScreen":ev,
+                "timeframes":{tf:{
+                    "lastClose":b[tf][-1]["c"],"rsi14":b[tf][-1]["rsi"],
+                    "lastVolume":b[tf][-1]["v"],"candles":b[tf][-60:]
+                } for tf in TIMEFRAMES}
+            })
         except Exception as e:
-            results.append({"symbol":x.get("symbol","?"),"error":str(e),"score":-1})
-    good=[x for x in results if x.get("score",-1)>=0]; good.sort(key=lambda x:x["score"],reverse=True)
-    audit("scan_everything",account["id"],symbols=len(inst),successful=len(good))
-    return {"account":public_account(account),"symbolsScanned":len(inst),"timeframes":list(TIMEFRAMES),"results":good,"errors":[x for x in results if "error" in x],"topProposals":[x["proposal"] for x in good[:3]],"executionEnabled":EXECUTION_ENABLED,"liveExecutionEnabled":LIVE_EXECUTION_ENABLED}
+            results.append({"symbol":x.get("symbol","?"),"error":str(e)})
+    session_id="scan-"+uuid.uuid4().hex[:16]
+    payload={"scanSessionId":session_id,"account":public_account(account),"symbolsScanned":len(inst),
+             "timeframes":list(TIMEFRAMES),"results":results,
+             "executionEnabled":EXECUTION_ENABLED,"liveExecutionEnabled":LIVE_EXECUTION_ENABLED,
+             "strategyRequired":True,
+             "message":"Market data collected. The linked ChatGPT strategy conversation must rank and submit the trade proposals."}
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("INSERT INTO scan_sessions(id,account_id,payload_json,created_at) VALUES(?,?,?,?)",
+                  (session_id,account["id"],json.dumps(payload),utcnow()))
+    audit("scan_everything",account["id"],scan_session_id=session_id,symbols=len(inst))
+    return payload
 
+def save_proposal(p: dict[str,Any]) -> None:
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("INSERT OR REPLACE INTO proposals(id,account_id,payload_json,status,created_at) VALUES(?,?,?,?,?)",
+                  (p["proposalId"],p["accountId"],json.dumps(p),p["status"],utcnow()))
+
+def latest_strategy_proposals(account_id: str | None=None) -> list[dict[str,Any]]:
+    aid=account_id or active_account()["id"]
+    with sqlite3.connect(DB_PATH) as c:
+        c.row_factory=sqlite3.Row
+        rows=c.execute("SELECT payload_json FROM proposals WHERE account_id=? ORDER BY created_at DESC LIMIT 30",(aid,)).fetchall()
+    out=[]; seen=set()
+    for r in rows:
+        p=json.loads(r["payload_json"])
+        if p.get("source")!="CHATGPT_STRATEGY": continue
+        sid=p.get("scanSessionId")
+        if not seen: first=sid
+        if sid!=first: break
+        if p["proposalId"] not in seen: out.append(p); seen.add(p["proposalId"])
+    return sorted(out,key=lambda x:x.get("rank",99))[:3]
 
 def public_account(a: dict[str,Any]) -> dict[str,Any]:
     return {k:a.get(k) for k in ("id","platform","account_number","account_id","acc_num","environment","label")}
@@ -408,12 +440,17 @@ class MTConnect(BaseModel):
 class SelectReq(BaseModel): account_id: str
 class ScanReq(BaseModel): account_id: str | None = None; max_symbols: int = Field(default=40, ge=1, le=200)
 class ApproveReq(BaseModel): proposal_id: str; qty: float = Field(gt=0); order_type: str = "market"; use_tp2: bool = False
+class StrategyProposalItem(BaseModel):
+    rank: int = Field(ge=1,le=3); symbol: str; direction: str; entry: float; safe_loss: float; take_profit_1: float; take_profit_2: float; risk_percent: float = Field(gt=0,le=5); score: float = Field(ge=0,le=100); explanation: str = ""
+class StrategySubmitReq(BaseModel):
+    scan_session_id: str; conversation_label: str = "Existing ChatGPT trading conversation"; conversation_reference: str | None = None; proposals: list[StrategyProposalItem]
+class StrategyExplanationReq(BaseModel): proposal_id: str; explanation: str; conversation_reference: str | None = None
 class AlertReq(BaseModel): symbol: str; condition: str; level: float
 
 
 @app.get("/health")
 def health():
-    return {"ok":True,"version":"1.0.0","executionEnabled":EXECUTION_ENABLED,"liveExecutionEnabled":LIVE_EXECUTION_ENABLED,"database":str(DB_PATH.name)}
+    return {"ok":True,"version":"1.2.0","executionEnabled":EXECUTION_ENABLED,"liveExecutionEnabled":LIVE_EXECUTION_ENABLED,"database":str(DB_PATH.name)}
 
 @app.get("/api/accounts")
 def api_accounts(): return {"accounts":[public_account(a) for a in all_accounts()],"active":public_account(active_account())}
@@ -463,12 +500,54 @@ def api_chart(symbol: str, account_id: str | None=None):
     if not inst: raise HTTPException(404,"Symbol not found")
     b=bundle_for(a,inst); return {"account":public_account(a),"symbol":symbol,"bundle":b}
 
+@app.get("/api/strategy/proposals")
+def api_strategy_proposals(account_id: str | None=None):
+    return {"proposals":latest_strategy_proposals(account_id)}
+
+@app.post("/api/strategy/proposals")
+def api_strategy_submit(req: StrategySubmitReq):
+    with sqlite3.connect(DB_PATH) as c:
+        c.row_factory=sqlite3.Row; row=c.execute("SELECT * FROM scan_sessions WHERE id=?",(req.scan_session_id,)).fetchone()
+    if not row: raise HTTPException(404,"Scan session not found")
+    session=json.loads(row["payload_json"]); account=session["account"]
+    allowed={x.get("symbol") for x in session.get("results",[]) if not x.get("error")}
+    if len(req.proposals)>3: raise HTTPException(400,"Submit at most three proposals")
+    saved=[]
+    for item in req.proposals:
+        if item.symbol not in allowed: raise HTTPException(400,f"{item.symbol} was not in scan session")
+        direction=item.direction.upper();
+        if direction not in ("BUY","SELL","LONG","SHORT"): raise HTTPException(400,"direction must be BUY/SELL/LONG/SHORT")
+        direction="BUY" if direction in ("BUY","LONG") else "SELL"
+        p={"proposalId":"ai-"+uuid.uuid4().hex[:16],"scanSessionId":req.scan_session_id,"accountId":account["id"],
+           "platform":account["platform"],"accountNumber":account["account_number"],"symbol":item.symbol,
+           "instrument":next((x.get("instrument") for x in session["results"] if x.get("symbol")==item.symbol),{"symbol":item.symbol}),
+           "direction":direction,"entry":item.entry,"safeLoss":item.safe_loss,"takeProfit1":item.take_profit_1,"takeProfit2":item.take_profit_2,
+           "riskPercent":item.risk_percent,"score":item.score,"rank":item.rank,"explanation":item.explanation,
+           "source":"CHATGPT_STRATEGY","conversationLabel":req.conversation_label,"conversationReference":req.conversation_reference,
+           "status":"AWAITING_APPROVAL"}
+        save_proposal(p); saved.append(p)
+    audit("chatgpt_strategy_proposals",account["id"],scan_session_id=req.scan_session_id,count=len(saved),conversation=req.conversation_label)
+    return {"status":"RECEIVED_FROM_CHATGPT_STRATEGY","proposals":sorted(saved,key=lambda x:x["rank"])}
+
+@app.post("/api/strategy/explanation")
+def api_strategy_explanation(req: StrategyExplanationReq):
+    with sqlite3.connect(DB_PATH) as c:
+        c.row_factory=sqlite3.Row; row=c.execute("SELECT * FROM proposals WHERE id=?",(req.proposal_id,)).fetchone()
+        if not row: raise HTTPException(404,"Proposal not found")
+        p=json.loads(row["payload_json"]); p["explanation"]=req.explanation
+        if req.conversation_reference: p["conversationReference"]=req.conversation_reference
+        c.execute("UPDATE proposals SET payload_json=? WHERE id=?",(json.dumps(p),req.proposal_id))
+    audit("chatgpt_strategy_explanation",p.get("accountId"),proposal_id=req.proposal_id)
+    return {"status":"EXPLANATION_STORED","proposal":p}
+
 @app.post("/api/proposals/approve")
 def approve(req: ApproveReq):
     with sqlite3.connect(DB_PATH) as c:
         c.row_factory=sqlite3.Row; row=c.execute("SELECT * FROM proposals WHERE id=?",(req.proposal_id,)).fetchone()
     if not row: raise HTTPException(404,"Proposal not found")
-    p=json.loads(row["payload_json"]); a=next((x for x in all_accounts() if x["id"]==p["accountId"]),None)
+    p=json.loads(row["payload_json"]);
+    if p.get("source") != "CHATGPT_STRATEGY": raise HTTPException(403,"Only proposals submitted by the linked ChatGPT strategy conversation can be approved.")
+    a=next((x for x in all_accounts() if x["id"]==p["accountId"]),None)
     if not a: raise HTTPException(404,"Account not found")
     # Simulation accounts always simulate. Real accounts require explicit server switches.
     if a["id"].startswith("sim-") or not EXECUTION_ENABLED:
@@ -505,7 +584,10 @@ TOOLS = [
  {"name":"get_active_account","description":"Return the exact active TradeLocker or MetaTrader account.","inputSchema":{"type":"object","properties":{}}},
  {"name":"list_accounts","description":"List connected trading accounts and exact account numbers.","inputSchema":{"type":"object","properties":{}}},
  {"name":"select_account","description":"Select the exact account used by future scans/actions.","inputSchema":{"type":"object","properties":{"account_id":{"type":"string"}},"required":["account_id"]}},
- {"name":"scan_everything","description":"Scan every broker-visible instrument on 4H, 1H, 15M and 5M using candle, volume and RSI data. Return ranked results and the top 3 proposed trades.","inputSchema":{"type":"object","properties":{"max_symbols":{"type":"integer","default":40}}}},
+ {"name":"scan_everything","description":"Collect every broker-visible instrument on 4H, 1H, 15M and 5M with candles, volume and RSI. This tool does NOT choose trades. Use your conversation's saved trading rules to rank candidates, then call submit_trade_proposals.","inputSchema":{"type":"object","properties":{"max_symbols":{"type":"integer","default":40}}}},
+ {"name":"submit_trade_proposals","description":"Submit up to three trade proposals chosen by this ChatGPT strategy conversation from a scan session. Include the conversation's own explanation for each proposal.","inputSchema":{"type":"object","properties":{"scan_session_id":{"type":"string"},"conversation_label":{"type":"string"},"conversation_reference":{"type":"string"},"proposals":{"type":"array","items":{"type":"object","properties":{"rank":{"type":"integer"},"symbol":{"type":"string"},"direction":{"type":"string"},"entry":{"type":"number"},"safe_loss":{"type":"number"},"take_profit_1":{"type":"number"},"take_profit_2":{"type":"number"},"risk_percent":{"type":"number"},"score":{"type":"number"},"explanation":{"type":"string"}},"required":["rank","symbol","direction","entry","safe_loss","take_profit_1","take_profit_2","risk_percent","score"]}}},"required":["scan_session_id","proposals"]}},
+ {"name":"submit_trade_explanation","description":"Store or replace the explanation for a specific proposal using reasoning from this ChatGPT strategy conversation.","inputSchema":{"type":"object","properties":{"proposal_id":{"type":"string"},"explanation":{"type":"string"},"conversation_reference":{"type":"string"}},"required":["proposal_id","explanation"]}},
+ {"name":"get_latest_strategy_proposals","description":"Return the latest top trade proposals submitted by the ChatGPT strategy conversation for the active account.","inputSchema":{"type":"object","properties":{}}},
  {"name":"get_chart_bundle","description":"Return four-timeframe candle, volume and RSI data for one broker symbol.","inputSchema":{"type":"object","properties":{"symbol":{"type":"string"}},"required":["symbol"]}},
  {"name":"approve_trade","description":"Approve a proposal. Server risk/execution policy still applies; qty is mandatory.","inputSchema":{"type":"object","properties":{"proposal_id":{"type":"string"},"qty":{"type":"number"},"use_tp2":{"type":"boolean"}},"required":["proposal_id","qty"]}},
  {"name":"reject_trade","description":"Reject a proposed trade.","inputSchema":{"type":"object","properties":{"proposal_id":{"type":"string"}},"required":["proposal_id"]}},
@@ -520,6 +602,9 @@ async def call_tool(name: str, args: dict[str,Any]) -> Any:
     if name=="list_accounts": return [public_account(x) for x in all_accounts()]
     if name=="select_account": return public_account(set_active(args["account_id"]))
     if name=="scan_everything": return scan(active_account(),int(args.get("max_symbols",40)))
+    if name=="submit_trade_proposals": return api_strategy_submit(StrategySubmitReq(**args))
+    if name=="submit_trade_explanation": return api_strategy_explanation(StrategyExplanationReq(**args))
+    if name=="get_latest_strategy_proposals": return {"proposals":latest_strategy_proposals()}
     if name=="get_chart_bundle":
         a=active_account(); inst=next((x for x in instruments_for(a) if x["symbol"]==args["symbol"]),None)
         if not inst: raise ValueError("Symbol not found")
@@ -533,7 +618,7 @@ async def call_tool(name: str, args: dict[str,Any]) -> Any:
 async def mcp(request: Request):
     body=await request.json(); method=body.get("method"); rid=body.get("id")
     try:
-        if method=="initialize": result={"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"ai-trading-bridge","version":"1.0.0"}}
+        if method=="initialize": result={"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"ai-trading-bridge","version":"1.2.0"}}
         elif method=="tools/list": result={"tools":TOOLS}
         elif method=="tools/call":
             p=body.get("params",{}); value=await call_tool(p.get("name"),p.get("arguments") or {})

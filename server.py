@@ -27,6 +27,10 @@ DB_PATH = Path(os.getenv("TRADING_BRIDGE_DB", ROOT / "trading_bridge.db"))
 APP_SECRET = os.getenv("TRADING_BRIDGE_SECRET")
 EXECUTION_ENABLED = os.getenv("TRADING_EXECUTION_ENABLED", "false").lower() == "true"
 LIVE_EXECUTION_ENABLED = os.getenv("TRADING_LIVE_EXECUTION_ENABLED", "false").lower() == "true"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-terra").strip() or "gpt-5.6-terra"
+STRATEGY_FILE = ROOT / "strategy_bootstrap.json"
+TRUSTED_STRATEGY_SOURCES = {"CHATGPT_STRATEGY", "BOOTSTRAPPED_CHATGPT_STRATEGY"}
 
 
 def _fernet() -> Fernet:
@@ -42,7 +46,126 @@ def _fernet() -> Fernet:
     return Fernet(seed)
 
 FERNET = _fernet()
-app = FastAPI(title="AI Trading Bridge", version="1.2.0")
+app = FastAPI(title="AI Trading Bridge", version="1.3.0")
+
+
+
+def load_strategy_bootstrap() -> dict[str, Any]:
+    try:
+        return json.loads(STRATEGY_FILE.read_text())
+    except Exception as e:
+        raise RuntimeError(f"Could not load strategy bootstrap: {e}") from e
+
+STRATEGY_BOOTSTRAP = load_strategy_bootstrap()
+
+def response_output_text(data: dict[str, Any]) -> str:
+    chunks=[]
+    for item in data.get("output", []) or []:
+        if item.get("type") != "message":
+            continue
+        for c in item.get("content", []) or []:
+            if c.get("type") in ("output_text", "text") and c.get("text"):
+                chunks.append(c["text"])
+    return "\n".join(chunks).strip()
+
+def parse_json_object(text: str) -> dict[str, Any]:
+    text=text.strip()
+    if text.startswith("```"):
+        text=text.strip("`")
+        if text.lower().startswith("json"):
+            text=text[4:].lstrip()
+    try:
+        return json.loads(text)
+    except Exception:
+        start=text.find("{"); end=text.rfind("}")
+        if start>=0 and end>start:
+            return json.loads(text[start:end+1])
+        raise ValueError("Strategy model did not return valid JSON")
+
+def strategy_prompt(scan_payload: dict[str, Any]) -> str:
+    return f"""You are the AI Trading Bridge strategy engine bootstrapped from an existing ChatGPT trading conversation.
+
+PERMANENT STRATEGY RULES:
+{json.dumps(STRATEGY_BOOTSTRAP, separators=(',', ':'))}
+
+CURRENT SCAN SESSION:
+{json.dumps(scan_payload, separators=(',', ':'))}
+
+Analyze every scanned instrument using the permanent rules. Do not use the technicalScreen score as the decision; it is only precomputed context. Use the actual 4H, 1H, 15M, and 5M OHLC, volume, and RSI data. Select zero to three proposals. Only A+ or A setups may be proposed. B setups must not be proposed. If there are no A/A+ setups, return an empty proposals array. Do not force three trades. Consider correlated exposure. Do not claim a safe position size because numeric risk limits have not been configured.
+
+Return ONLY valid JSON with this exact top-level shape:
+{{
+  "scan_session_id": "{scan_payload.get('scanSessionId','')}",
+  "summary": "short overall scan summary",
+  "proposals": [
+    {{
+      "rank": 1,
+      "symbol": "broker exact symbol",
+      "direction": "BUY or SELL",
+      "setup_grade": "A+ or A",
+      "score": 0,
+      "entry": 0,
+      "safe_loss": 0,
+      "take_profit_1": 0,
+      "take_profit_2": 0,
+      "risk_percent": null,
+      "risk_reward": "text ratio or description",
+      "invalidation": "specific structural invalidation",
+      "missing_confirmation": "none or what is still missing",
+      "explanation": "Detailed reasoning covering 4H bias, 1H structure, 15M setup, 5M trigger, RSI, volume, key level, entry logic, stop, targets, cancellation condition and why the grade is A/A+."
+    }}
+  ]
+}}
+"""
+
+def run_bootstrapped_strategy(scan_payload: dict[str, Any]) -> dict[str, Any]:
+    if not OPENAI_API_KEY:
+        return {"status":"OPENAI_NOT_CONFIGURED","message":"Add OPENAI_API_KEY on the server to enable the bootstrapped strategy engine."}
+    headers={"Authorization":f"Bearer {OPENAI_API_KEY}","Content-Type":"application/json"}
+    body={
+        "model":OPENAI_MODEL,
+        "input":strategy_prompt(scan_payload),
+        "max_output_tokens":7000
+    }
+    with httpx.Client(timeout=180.0) as client:
+        r=client.post("https://api.openai.com/v1/responses",headers=headers,json=body)
+        r.raise_for_status(); raw=r.json()
+    text=response_output_text(raw)
+    parsed=parse_json_object(text)
+    proposals=parsed.get("proposals") or []
+    if not isinstance(proposals,list) or len(proposals)>3:
+        raise ValueError("Strategy response must contain zero to three proposals")
+    return {"status":"ANALYZED","model":OPENAI_MODEL,"response_id":raw.get("id"),"summary":parsed.get("summary",""),"proposals":proposals}
+
+def save_bootstrapped_strategy_proposals(scan_payload: dict[str, Any], analysis: dict[str, Any]) -> list[dict[str, Any]]:
+    account=scan_payload["account"]; allowed={x.get("symbol") for x in scan_payload.get("results",[]) if not x.get("error")}; saved=[]
+    for idx,item in enumerate(analysis.get("proposals") or []):
+        symbol=item.get("symbol")
+        if symbol not in allowed:
+            continue
+        direction=str(item.get("direction","")).upper()
+        if direction not in ("BUY","SELL"):
+            continue
+        grade=str(item.get("setup_grade","")).upper()
+        if grade not in ("A","A+"):
+            continue
+        try:
+            entry=float(item["entry"]); sl=float(item["safe_loss"]); tp1=float(item["take_profit_1"]); tp2=float(item["take_profit_2"]); score=float(item.get("score",0))
+        except Exception:
+            continue
+        inst=next((x.get("instrument") for x in scan_payload["results"] if x.get("symbol")==symbol),{"symbol":symbol})
+        p={"proposalId":"bootstrap-"+uuid.uuid4().hex[:16],"scanSessionId":scan_payload["scanSessionId"],"accountId":account["id"],
+           "platform":account["platform"],"accountNumber":account["account_number"],"symbol":symbol,"instrument":inst,
+           "direction":direction,"entry":entry,"safeLoss":sl,"takeProfit1":tp1,"takeProfit2":tp2,
+           "riskPercent":None,"score":max(0,min(100,score)),"rank":idx+1,"setupGrade":grade,
+           "riskReward":item.get("risk_reward","") or "","invalidation":item.get("invalidation","") or "",
+           "missingConfirmation":item.get("missing_confirmation","") or "",
+           "explanation":item.get("explanation","") or "","source":"BOOTSTRAPPED_CHATGPT_STRATEGY",
+           "conversationLabel":"AI Trading 5k funded · Bootstrap v1","conversationReference":"exported_strategy_bootstrap_v1",
+           "strategyModel":analysis.get("model"),"strategyResponseId":analysis.get("response_id"),"status":"AWAITING_APPROVAL"}
+        save_proposal(p); saved.append(p)
+    audit("bootstrapped_openai_strategy",account["id"],scan_session_id=scan_payload["scanSessionId"],count=len(saved),model=analysis.get("model"),response_id=analysis.get("response_id"))
+    return saved
 
 TIMEFRAMES = {"4H": "4H", "1H": "1H", "15M": "15m", "5M": "5m"}
 TF_SECONDS = {"4H": 14400, "1H": 3600, "15M": 900, "5M": 300}
@@ -422,7 +545,7 @@ def latest_strategy_proposals(account_id: str | None=None) -> list[dict[str,Any]
     out=[]; seen=set()
     for r in rows:
         p=json.loads(r["payload_json"])
-        if p.get("source")!="CHATGPT_STRATEGY": continue
+        if p.get("source") not in TRUSTED_STRATEGY_SOURCES: continue
         sid=p.get("scanSessionId")
         if not seen: first=sid
         if sid!=first: break
@@ -441,7 +564,7 @@ class SelectReq(BaseModel): account_id: str
 class ScanReq(BaseModel): account_id: str | None = None; max_symbols: int = Field(default=40, ge=1, le=200)
 class ApproveReq(BaseModel): proposal_id: str; qty: float = Field(gt=0); order_type: str = "market"; use_tp2: bool = False
 class StrategyProposalItem(BaseModel):
-    rank: int = Field(ge=1,le=3); symbol: str; direction: str; entry: float; safe_loss: float; take_profit_1: float; take_profit_2: float; risk_percent: float = Field(gt=0,le=5); score: float = Field(ge=0,le=100); explanation: str = ""
+    rank: int = Field(ge=1,le=3); symbol: str; direction: str; entry: float; safe_loss: float; take_profit_1: float; take_profit_2: float; risk_percent: float | None = Field(default=None, gt=0,le=5); score: float = Field(ge=0,le=100); explanation: str = ""
 class StrategySubmitReq(BaseModel):
     scan_session_id: str; conversation_label: str = "Existing ChatGPT trading conversation"; conversation_reference: str | None = None; proposals: list[StrategyProposalItem]
 class StrategyExplanationReq(BaseModel): proposal_id: str; explanation: str; conversation_reference: str | None = None
@@ -450,7 +573,7 @@ class AlertReq(BaseModel): symbol: str; condition: str; level: float
 
 @app.get("/health")
 def health():
-    return {"ok":True,"version":"1.2.0","executionEnabled":EXECUTION_ENABLED,"liveExecutionEnabled":LIVE_EXECUTION_ENABLED,"database":str(DB_PATH.name)}
+    return {"ok":True,"version":"1.3.0","executionEnabled":EXECUTION_ENABLED,"liveExecutionEnabled":LIVE_EXECUTION_ENABLED,"database":str(DB_PATH.name),"strategyConfigured":bool(OPENAI_API_KEY),"strategyModel":OPENAI_MODEL,"strategyName":STRATEGY_BOOTSTRAP.get("strategy_name")}
 
 @app.get("/api/accounts")
 def api_accounts(): return {"accounts":[public_account(a) for a in all_accounts()],"active":public_account(active_account())}
@@ -489,8 +612,36 @@ def connect_mt5(req: MTConnect):
 def api_scan(req: ScanReq):
     a=next((x for x in all_accounts() if x["id"]==(req.account_id or active_account()["id"])),None)
     if not a: raise HTTPException(404,"Account not found")
-    try: return scan(a,req.max_symbols)
+    try:
+        payload=scan(a,req.max_symbols)
+        if OPENAI_API_KEY:
+            analysis=run_bootstrapped_strategy(payload)
+            saved=save_bootstrapped_strategy_proposals(payload,analysis)
+            payload["strategy"]={"status":analysis.get("status"),"model":analysis.get("model"),"summary":analysis.get("summary",""),"proposalsSaved":len(saved),"source":"BOOTSTRAPPED_CHATGPT_STRATEGY"}
+        else:
+            payload["strategy"]={"status":"OPENAI_NOT_CONFIGURED","proposalsSaved":0,"source":"BOOTSTRAPPED_CHATGPT_STRATEGY"}
+        return payload
+    except httpx.HTTPStatusError as e:
+        detail=e.response.text[:1000] if e.response is not None else str(e)
+        raise HTTPException(502,f"OpenAI strategy request failed: {detail}")
     except Exception as e: raise HTTPException(502,str(e))
+
+@app.get("/api/strategy/status")
+def api_strategy_status():
+    return {"configured":bool(OPENAI_API_KEY),"model":OPENAI_MODEL,"strategy":STRATEGY_BOOTSTRAP.get("strategy_name"),"version":STRATEGY_BOOTSTRAP.get("version"),"sourceConversation":"AI Trading 5k funded","mode":"BOOTSTRAPPED_API_STRATEGY"}
+
+@app.post("/api/strategy/run/{scan_session_id}")
+def api_strategy_run(scan_session_id: str):
+    with sqlite3.connect(DB_PATH) as c:
+        c.row_factory=sqlite3.Row; row=c.execute("SELECT * FROM scan_sessions WHERE id=?",(scan_session_id,)).fetchone()
+    if not row: raise HTTPException(404,"Scan session not found")
+    payload=json.loads(row["payload_json"])
+    try:
+        analysis=run_bootstrapped_strategy(payload); saved=save_bootstrapped_strategy_proposals(payload,analysis)
+        return {"analysis":analysis,"proposals":saved}
+    except httpx.HTTPStatusError as e:
+        detail=e.response.text[:1000] if e.response is not None else str(e)
+        raise HTTPException(502,f"OpenAI strategy request failed: {detail}")
 
 @app.get("/api/chart/{symbol}")
 def api_chart(symbol: str, account_id: str | None=None):
@@ -546,7 +697,7 @@ def approve(req: ApproveReq):
         c.row_factory=sqlite3.Row; row=c.execute("SELECT * FROM proposals WHERE id=?",(req.proposal_id,)).fetchone()
     if not row: raise HTTPException(404,"Proposal not found")
     p=json.loads(row["payload_json"]);
-    if p.get("source") != "CHATGPT_STRATEGY": raise HTTPException(403,"Only proposals submitted by the linked ChatGPT strategy conversation can be approved.")
+    if p.get("source") not in TRUSTED_STRATEGY_SOURCES: raise HTTPException(403,"Only proposals produced by an approved ChatGPT strategy source can be approved.")
     a=next((x for x in all_accounts() if x["id"]==p["accountId"]),None)
     if not a: raise HTTPException(404,"Account not found")
     # Simulation accounts always simulate. Real accounts require explicit server switches.
@@ -618,7 +769,7 @@ async def call_tool(name: str, args: dict[str,Any]) -> Any:
 async def mcp(request: Request):
     body=await request.json(); method=body.get("method"); rid=body.get("id")
     try:
-        if method=="initialize": result={"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"ai-trading-bridge","version":"1.2.0"}}
+        if method=="initialize": result={"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"ai-trading-bridge","version":"1.3.0"}}
         elif method=="tools/list": result={"tools":TOOLS}
         elif method=="tools/call":
             p=body.get("params",{}); value=await call_tool(p.get("name"),p.get("arguments") or {})

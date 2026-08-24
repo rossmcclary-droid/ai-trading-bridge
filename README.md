@@ -1,16 +1,18 @@
-# AI Trading Bridge v1.2
+# AI Trading Bridge v1.3
 
-A mobile-first PWA + FastAPI/MCP bridge for TradeLocker and MetaTrader 5. The bridge collects 4H / 1H / 15M / 5M candles, volume and RSI, but the linked ChatGPT trading conversation is the strategy source: it ranks the Top 3, submits the trade proposals, and supplies the explanations.
+A mobile-first PWA + FastAPI/MCP bridge for TradeLocker and MetaTrader 5. v1.3 adds an OpenAI API strategy brain initialized from `strategy_bootstrap.json`, which was exported from the existing AI Trading 5k funded ChatGPT conversation. The bridge collects 4H / 1H / 15M / 5M candles, volume and RSI; the API strategy applies those exported rules to rank zero to three A/A+ setups and generates the explanation attached to each proposal.
 
-## What is real in v1.2
+## What is real in v1.3
 
 - Persistent SQLite database for connections, exact broker accounts, alerts, proposals and audit events.
 - TradeLocker JWT login, account discovery, broker instrument discovery, historical candle retrieval, positions/orders access and order placement adapter.
 - MetaTrader 5 Python adapter for account login, Market Watch symbols, candle retrieval, positions/orders and market order sending. The MT5 backend must run on Windows with the MetaTrader 5 terminal installed.
 - RSI(14), volume and four-timeframe market-data collection.
-- ChatGPT-strategy proposal inbox: only proposals submitted through `submit_trade_proposals` are approvable.
-- Explanations are stored from the ChatGPT strategy conversation; the bridge does not fabricate replacement reasoning.
-- Top 3 UI refreshes from the latest ChatGPT strategy submission.
+- Bundled `strategy_bootstrap.json` containing the permanent strategy exported from the existing ChatGPT trading conversation.
+- OpenAI Responses API strategy service. When `OPENAI_API_KEY` is configured, Scan Everything automatically sends the complete scan session to the bootstrapped strategy brain.
+- The strategy may return zero to three proposals; only A/A+ setups are eligible. It is explicitly instructed not to force three trades.
+- Each proposal stores the AI strategy explanation and response reference. EXP displays that exact explanation rather than generating separate local RSI text.
+- The older MCP submission path remains available for a future direct ChatGPT custom-app connection.
 - Mobile PWA with exact active platform/account number, top-3 proposals, EXP / APP / EXP+APP / REJECT workflow and broker connection forms.
 - MCP endpoint at `/mcp` plus tool catalog at `/mcp-tools` so the same backend can be exposed to ChatGPT as a custom app when the account/product supports it.
 - Encrypted broker credential storage and an audit log.
@@ -59,6 +61,8 @@ TRADING_BRIDGE_DB=trading_bridge.db
 PORT=8080
 TRADING_EXECUTION_ENABLED=false
 TRADING_LIVE_EXECUTION_ENABLED=false
+OPENAI_API_KEY=<server-side OpenAI API key>
+OPENAI_MODEL=gpt-5.6-terra
 ```
 
 Generate a Fernet key:
@@ -72,6 +76,8 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 ```text
 TRADING_EXECUTION_ENABLED=true
 TRADING_LIVE_EXECUTION_ENABLED=false
+OPENAI_API_KEY=<server-side OpenAI API key>
+OPENAI_MODEL=gpt-5.6-terra
 ```
 
 This permits execution on connected non-LIVE accounts while retaining the live-account lock. Enabling `TRADING_LIVE_EXECUTION_ENABLED=true` removes the second lock; do this only after broker-specific validation.
@@ -113,13 +119,25 @@ The desired flow is: existing ChatGPT conversation → `scan_everything` → top
 - For a public internet deployment, add authentication for the web UI/API, HTTPS, rate limiting and a production secret manager before exposing it.
 
 
-## v1.2 strategy workflow
+## v1.3 Plus-compatible strategy workflow
 
-1. The linked ChatGPT conversation calls `scan_everything`.
-2. The bridge returns a `scanSessionId` plus broker/account identity and all requested timeframe data.
-3. ChatGPT applies the trading rules and context already present in that conversation.
-4. ChatGPT calls `submit_trade_proposals` with up to three ranked trades and its explanation for each.
-5. The phone app displays those exact proposals. `EXP` reveals the stored ChatGPT explanation.
-6. `APP` / `EXP + APP` can only approve a proposal whose `source` is `CHATGPT_STRATEGY`; server risk/execution locks still apply.
+Because a Plus consumer chat cannot currently be treated as an external API endpoint, v1.3 uses the exported strategy bootstrap as the persistent rules for a separate OpenAI API strategy session. This is intentionally labeled **Bootstrapped API strategy** in the app; it does not claim to be the literal consumer ChatGPT thread.
 
-Important product limitation: the web app cannot inject a message into an arbitrary consumer ChatGPT conversation by itself. The existing ChatGPT conversation must have the Trading Bridge connected as a supported custom app/MCP tool and invoke these tools from that conversation.
+1. Press **Scan Everything**.
+2. The bridge collects every broker-visible symbol with 4H / 1H / 15M / 5M candles, volume and RSI.
+3. If `OPENAI_API_KEY` is configured, the server sends that scan plus `strategy_bootstrap.json` to the OpenAI Responses API.
+4. The strategy returns zero to three A/A+ proposals. No clean setup is a valid result.
+5. The phone app displays only those proposals.
+6. **EXP** displays the explanation generated by the same strategy response that proposed the trade.
+7. **APP / EXP+APP** still pass through the server execution locks. Live broker execution remains disabled by default.
+
+If the original ChatGPT trading conversation learns or changes permanent rules later, export a new bootstrap and replace `strategy_bootstrap.json` so the API strategy stays synchronized with that conversation's framework.
+
+## Add the OpenAI API key on Render
+
+Never commit an API key to GitHub. Add it only in Render → service → Environment:
+
+- `OPENAI_API_KEY` = your API project key
+- `OPENAI_MODEL` = `gpt-5.6-terra` (default)
+
+The API is billed separately from a ChatGPT Plus subscription. The `/health` and `/api/strategy/status` endpoints show whether the strategy key is configured without revealing the key.

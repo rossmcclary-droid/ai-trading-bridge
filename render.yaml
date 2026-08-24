@@ -14,3 +14,7 @@ services:
         value: "false"
       - key: TRADING_LIVE_EXECUTION_ENABLED
         value: "false"
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: "gpt-5.6-terra"

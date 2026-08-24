@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#0b1018" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+  <title>AI Trading Bridge</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">AI TRADING BRIDGE · BROKER CONNECTED</div>
+        <h1>AI Trading Bridge</h1>
+      </div>
+      <div class="top-actions">
+        <select id="accountSelect" aria-label="Trading account"></select>
+        <button id="brokerConnectBtn" class="secondary">Connect Broker</button>
+        <button id="connectBtn" class="secondary">Account Details</button>
+        <button id="installBtn" class="secondary install-btn hidden">Install App</button>
+        <button id="scanBtn" class="primary">Scan Everything</button>
+      </div>
+    </header>
+
+    <section class="active-account-bar">
+      <div class="account-identity">
+        <span class="platform-mark" id="platformMark">TL</span>
+        <div>
+          <div class="eyebrow">ACTIVE TRADING ACCOUNT</div>
+          <strong id="activeAccountLabel">TradeLocker · Account 784215</strong>
+        </div>
+      </div>
+      <div class="account-meta">
+        <span id="activeEnvironment">DEMO</span>
+        <span id="activeWatchSource">Broker Symbols</span>
+        <span id="conversationStatus" class="connection-off">AI conversation not linked</span>
+      </div>
+    </section>
+
+    <section class="status-grid">
+      <article class="stat"><span>Balance</span><strong id="balance">$0</strong></article>
+      <article class="stat"><span>Equity</span><strong id="equity">$0</strong></article>
+      <article class="stat"><span>Daily P/L</span><strong id="dailyPl">$0</strong></article>
+      <article class="stat"><span>Open</span><strong id="openCount">0</strong></article>
+      <article class="stat"><span>Pending</span><strong id="pendingCount">0</strong></article>
+      <article class="stat"><span>Alerts</span><strong id="alertCount">0</strong></article>
+    </section>
+
+    <main class="workspace">
+      <aside class="sidebar card">
+        <div class="card-head">
+          <div>
+            <div class="eyebrow">BROKER WATCHLIST</div>
+            <h2 id="watchlistTitle">Symbols</h2>
+          </div>
+          <span class="pill" id="brokerPill"></span>
+        </div>
+        <div class="account-mini" id="watchAccountMini"></div>
+        <div id="watchlist" class="watchlist"></div>
+        <div class="sidebar-actions">
+          <button id="newAlertBtn" class="secondary full">+ Create Alert</button>
+          <button id="refreshBtn" class="ghost full">Refresh Broker Symbols</button>
+        </div>
+      </aside>
+
+      <section class="center-column">
+        <section class="card chart-card">
+          <div class="card-head chart-title-row">
+            <div>
+              <div class="eyebrow">SELECTED INSTRUMENT</div>
+              <h2><span id="symbolTitle">BTCUSD</span> <span id="priceTitle" class="muted"></span></h2>
+            </div>
+            <div class="legend"><span>Candles</span><span>Volume</span><span>RSI 14</span></div>
+          </div>
+          <div class="chart-grid">
+            <div class="chart-panel"><div class="tf-label">4H</div><canvas id="chart4h"></canvas></div>
+            <div class="chart-panel"><div class="tf-label">1H</div><canvas id="chart1h"></canvas></div>
+            <div class="chart-panel"><div class="tf-label">15M</div><canvas id="chart15m"></canvas></div>
+            <div class="chart-panel"><div class="tf-label">5M</div><canvas id="chart5m"></canvas></div>
+          </div>
+        </section>
+
+        <section class="card top3-card" id="top3Section">
+          <div class="card-head">
+            <div>
+              <div class="eyebrow">RANKED SCAN RESULTS</div>
+              <h2>Top 3 Trade Setups</h2>
+            </div>
+            <span class="pill neutral" id="top3Status">Run scan</span>
+          </div>
+          <div id="top3List" class="top3-list">
+            <div class="proposal-empty">Tap <b>Scan Everything</b> to rank the three strongest setups on this account.</div>
+          </div>
+        </section>
+
+        <section class="card proposal-card">
+          <div class="card-head">
+            <div>
+              <div class="eyebrow">AI TRADE PROPOSAL</div>
+              <h2 id="proposalHeadline">Waiting for scan</h2>
+            </div>
+            <select id="executionMode" aria-label="Execution mode">
+              <option>Approval Mode</option>
+              <option>Analysis Mode</option>
+              <option>Auto-Execution Mode</option>
+            </select>
+          </div>
+          <div id="proposalBody" class="proposal-empty">Select a symbol or scan the broker watchlist.</div>
+          <div class="proposal-actions">
+            <button id="expBtn" class="secondary">EXP</button>
+            <button id="appBtn" class="success">APP</button>
+            <button id="expAppBtn" class="accent">EXP + APP</button>
+            <button id="rejectBtn" class="danger">REJECT</button>
+          </div>
+          <div id="explanation" class="explanation hidden"></div>
+        </section>
+      </section>
+
+      <aside class="right-column">
+        <section class="card conversation-link-card">
+          <div class="card-head">
+            <div><div class="eyebrow">CHATGPT CONNECTOR</div><h2>Trading App Tools</h2></div>
+            <span class="pill neutral" id="linkPill">Local demo</span>
+          </div>
+          <div class="connector-status">
+            <div class="risk-row"><span>Connector type</span><strong>MCP / ChatGPT App</strong></div>
+            <div class="risk-row"><span>Local endpoint</span><strong>/mcp</strong></div>
+            <div class="risk-row"><span>Execution</span><strong>SIMULATED ONLY</strong></div>
+            <div class="risk-row"><span>Conversation</span><strong>Your existing ChatGPT chat</strong></div>
+          </div>
+          <div class="link-actions">
+            <button id="testConnectorBtn" class="primary">Test Connector</button>
+            <button id="showToolsBtn" class="secondary">Show Tools</button>
+          </div>
+          <div id="conversationNote" class="bridge-note">In a supported ChatGPT plan, add this server as a custom app/MCP connector. Then your existing conversation can call tools such as <b>scan_everything</b> without moving its saved context into a new chat.</div>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <div><div class="eyebrow">AI ASSISTANT</div><h2>Conversation Relay</h2></div>
+            <span class="pill neutral">Demo AI</span>
+          </div>
+          <div id="chatLog" class="chat-log"></div>
+          <form id="chatForm" class="chat-form">
+            <input id="chatInput" placeholder="Ask: scan everything, explain BTCUSD…" autocomplete="off" />
+            <button class="primary" type="submit">Send</button>
+          </form>
+        </section>
+
+        <section class="card compact-card">
+          <div class="card-head"><div><div class="eyebrow">RISK ENGINE</div><h2>Hard Limits</h2></div></div>
+          <div class="risk-row"><span>Risk / trade</span><strong>0.50%</strong></div>
+          <div class="risk-row"><span>Max daily loss</span><strong>2.00%</strong></div>
+          <div class="risk-row"><span>Max simultaneous</span><strong>3</strong></div>
+          <div class="risk-row"><span>Stop loss required</span><strong>Yes</strong></div>
+        </section>
+
+        <section class="card compact-card">
+          <div class="card-head"><div><div class="eyebrow">ACTIVITY</div><h2>Execution Log</h2></div></div>
+          <div id="activityLog" class="activity-log"></div>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <dialog id="alertDialog">
+    <form method="dialog" id="alertForm" class="dialog-card">
+      <div class="card-head"><div><div class="eyebrow">NEW ALERT</div><h2>Create Broker Alert</h2></div></div>
+      <label>Symbol<select id="alertSymbol"></select></label>
+      <label>Condition<select id="alertCondition"><option value="above">Price above</option><option value="below">Price below</option><option value="rsiAbove">15M RSI above</option><option value="rsiBelow">15M RSI below</option></select></label>
+      <label>Level<input id="alertLevel" type="number" step="any" required /></label>
+      <div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button id="saveAlertBtn" value="default" class="primary">Save Alert</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="accountDialog">
+    <div class="dialog-card">
+      <div class="card-head"><div><div class="eyebrow">CONNECTED DEMO ACCOUNT</div><h2 id="accountDialogTitle"></h2></div></div>
+      <div id="accountDialogBody"></div>
+      <div class="dialog-actions"><button id="closeAccountDialog" class="primary">Close</button></div>
+    </div>
+  </dialog>
+
+  <nav class="mobile-action-bar" aria-label="Mobile actions">
+    <button id="mobileScanBtn" class="primary">Scan Everything</button>
+    <button id="mobileTop3Btn" class="secondary">Top 3</button>
+    <button id="mobileChartsBtn" class="secondary">Charts</button>
+  </nav>
+
+  <script src="app.js"></script>
+
+  <dialog id="brokerDialog" class="modal">
+    <div class="dialog-card">
+      <div class="card-head"><div><div class="eyebrow">BROKER CONNECTION</div><h2>Connect a trading account</h2></div><button id="closeBrokerDialog" class="ghost">Close</button></div>
+      <div class="notice">Start with a demo account. Credentials are encrypted by the backend before storage. Live order execution remains disabled unless the server owner explicitly enables it.</div>
+      <div class="connector-grid">
+        <form id="tlConnectForm" class="connector-form">
+          <h3>TradeLocker</h3>
+          <label>Email<input name="email" type="email" required autocomplete="username"></label>
+          <label>Password<input name="password" type="password" required autocomplete="current-password"></label>
+          <label>Server<input name="server" required placeholder="Broker server name"></label>
+          <label>Environment<select name="environment"><option>DEMO</option><option>LIVE</option></select></label>
+          <button class="primary" type="submit">Connect TradeLocker</button>
+        </form>
+        <form id="mt5ConnectForm" class="connector-form">
+          <h3>MetaTrader 5</h3>
+          <label>Login / account number<input name="login" required inputmode="numeric"></label>
+          <label>Password<input name="password" type="password" required></label>
+          <label>Server<input name="server" required placeholder="Broker MT5 server"></label>
+          <label>Terminal path (optional)<input name="terminal_path" placeholder="Windows MT5 terminal path"></label>
+          <button class="primary" type="submit">Connect MT5</button>
+          <small>MT5 requires the backend to run on a Windows computer/VPS with MetaTrader 5 installed and logged in.</small>
+        </form>
+      </div>
+      <div id="brokerConnectStatus" class="notice hidden"></div>
+    </div>
+  </dialog>
+
+</body>
+</html>

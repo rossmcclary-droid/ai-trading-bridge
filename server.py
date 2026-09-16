@@ -626,6 +626,74 @@ def api_scan(req: ScanReq):
         raise HTTPException(502,f"OpenAI strategy request failed: {detail}")
     except Exception as e: raise HTTPException(502,str(e))
 
+RADAR_REQUIRED_FIELDS = (
+    "bid", "ask", "currentDayHigh", "currentDayLow", "previousDayClose",
+    "previousDayHigh", "previousDayLow", "price1HourAgo", "price4HoursAgo",
+)
+
+
+def _radar_history_observation(account: dict[str, Any], instrument: dict[str, Any]) -> dict[str, Any]:
+    """Read-only Radar compatibility projection over verified Bridge history acquisition.
+
+    Deliberately does not synthesize quotes or assume broker session/day boundaries.
+    """
+    broker = broker_for(account)
+    if broker is None:
+        return {"status": "UNAVAILABLE", "reason": "authenticated_bridge_acquisition_unavailable"}
+    rows = broker.candles(account, instrument, "1H", 8)
+    completed = sorted((x for x in rows if x.get("time") is not None), key=lambda x: x["time"])
+    now_s = int(time.time())
+    completed = [x for x in completed if int(x["time"]) + TF_SECONDS["1H"] <= now_s]
+    latest = completed[-1] if completed else None
+    one = completed[-1] if completed else None
+    four = completed[-4] if len(completed) >= 4 else None
+    source_ts = latest.get("time") if latest else None
+    freshness = (now_s - int(source_ts)) if source_ts is not None else None
+    return {
+        "status": "QUESTIONABLE" if latest else "MISSING",
+        "reason": "live_quote_and_session_day_semantics_unverified",
+        "sourceTimestamp": source_ts,
+        "freshnessSeconds": freshness,
+        "price1HourAgo": one.get("c") if one else None,
+        "price4HoursAgo": four.get("c") if four else None,
+    }
+
+
+def radar_observation(symbol: str, account_id: str | None = None) -> dict[str, Any]:
+    account = next((x for x in all_accounts() if x["id"] == (account_id or active_account()["id"])), None)
+    if not account:
+        raise HTTPException(404, "Account not found")
+    instrument = next((x for x in instruments_for(account) if x["symbol"] == symbol), None)
+    if not instrument:
+        raise HTTPException(404, "Symbol not found")
+    hist = _radar_history_observation(account, instrument)
+    raw = {key: None for key in RADAR_REQUIRED_FIELDS}
+    raw["price1HourAgo"] = hist.get("price1HourAgo")
+    raw["price4HoursAgo"] = hist.get("price4HoursAgo")
+    return {
+        "symbol": symbol,
+        "raw": raw,
+        "quality": {"status": hist["status"], "reason": hist["reason"],
+                    "sourceTimestamp": hist.get("sourceTimestamp"), "freshnessSeconds": hist.get("freshnessSeconds")},
+        "session": {"dayBoundary": None, "status": "UNRESOLVED"},
+        "provenance": {"provider": "TradeLocker", "owner": "AI Trading Bridge",
+                       "acquisition": "authenticated_history", "reconnaissanceOnly": True},
+    }
+
+
+@app.get("/api/radar/v0/instruments")
+def api_radar_instruments(account_id: str | None = None):
+    account = next((x for x in all_accounts() if x["id"] == (account_id or active_account()["id"])), None)
+    if not account:
+        raise HTTPException(404, "Account not found")
+    return {"instruments": [{"symbol": x["symbol"]} for x in instruments_for(account)]}
+
+
+@app.get("/api/radar/v0/observations")
+def api_radar_observations(symbol: str, account_id: str | None = None):
+    return radar_observation(symbol, account_id)
+
+
 @app.get("/api/strategy/status")
 def api_strategy_status():
     return {"configured":bool(OPENAI_API_KEY),"model":OPENAI_MODEL,"strategy":STRATEGY_BOOTSTRAP.get("strategy_name"),"version":STRATEGY_BOOTSTRAP.get("version"),"sourceConversation":"AI Trading 5k funded","mode":"BOOTSTRAPPED_API_STRATEGY"}

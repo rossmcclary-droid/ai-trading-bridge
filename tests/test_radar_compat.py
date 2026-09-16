@@ -49,10 +49,10 @@ def test_completed_history_lookbacks_are_deterministic(monkeypatch):
 
 
 def test_radar_routes_are_get_only():
-    routes = {(r.path, tuple(sorted(r.methods or []))) for r in server.app.routes}
+    routes = {(r.path, tuple(sorted(r.methods))) for r in server.app.routes if getattr(r, "methods", None)}
     assert ("/api/radar/v0/instruments", ("GET",)) in routes
     assert ("/api/radar/v0/observations", ("GET",)) in routes
-    assert not any(path.startswith("/api/radar/") and any(m != "GET" for m in methods) for path, methods in routes)
+    assert not any(path.startswith("/api/radar/") and methods != ("GET",) for path, methods in routes)
 
 
 def test_radar_payload_contains_no_credential_fields():

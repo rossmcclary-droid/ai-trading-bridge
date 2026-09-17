@@ -315,6 +315,14 @@ class TradeLockerBroker:
             })
         return out
 
+    def quote_raw(self, account: dict[str, Any], instrument: dict[str, Any]) -> dict[str, Any]:
+        """Fetch the authenticated INFO-route quote payload without interpreting its schema."""
+        params = {"routeId": instrument["infoRouteId"],
+                  "tradableInstrumentId": instrument["tradableInstrumentId"]}
+        r = self.client.get(f"{self.base}/trade/quotes", params=params, headers=self._acc_headers(account))
+        r.raise_for_status()
+        return r.json()
+
     def candles(self, account: dict[str, Any], instrument: dict[str, Any], tf: str, count: int = 120) -> list[dict[str, Any]]:
         to_ms = int(time.time() * 1000); from_ms = to_ms - TF_SECONDS[tf] * count * 1000 * 2
         params = {"routeId": instrument["infoRouteId"], "from": from_ms, "to": to_ms,
@@ -632,6 +640,15 @@ RADAR_REQUIRED_FIELDS = (
 )
 
 
+def _radar_quote_observation(broker: Any, account: dict[str, Any], instrument: dict[str, Any]) -> dict[str, Any]:
+    """Preserve authenticated raw quote evidence; Bid/Ask stay unresolved until schema validation."""
+    quote_raw = getattr(broker, "quote_raw", None)
+    if quote_raw is None:
+        return {"status": "UNAVAILABLE", "reason": "authenticated_quote_acquisition_unavailable", "rawResponse": None}
+    payload = quote_raw(account, instrument)
+    return {"status": "QUESTIONABLE", "reason": "quote_schema_mapping_unverified", "rawResponse": payload}
+
+
 def _radar_history_observation(account: dict[str, Any], instrument: dict[str, Any]) -> dict[str, Any]:
     """Read-only Radar compatibility projection over verified Bridge history acquisition.
 
@@ -666,6 +683,9 @@ def radar_observation(symbol: str, account_id: str | None = None) -> dict[str, A
     instrument = next((x for x in instruments_for(account) if x["symbol"] == symbol), None)
     if not instrument:
         raise HTTPException(404, "Symbol not found")
+    broker = broker_for(account)
+    quote = _radar_quote_observation(broker, account, instrument) if broker is not None else {
+        "status": "UNAVAILABLE", "reason": "authenticated_bridge_acquisition_unavailable", "rawResponse": None}
     hist = _radar_history_observation(account, instrument)
     raw = {key: None for key in RADAR_REQUIRED_FIELDS}
     raw["price1HourAgo"] = hist.get("price1HourAgo")
@@ -676,8 +696,9 @@ def radar_observation(symbol: str, account_id: str | None = None) -> dict[str, A
         "quality": {"status": hist["status"], "reason": hist["reason"],
                     "sourceTimestamp": hist.get("sourceTimestamp"), "freshnessSeconds": hist.get("freshnessSeconds")},
         "session": {"dayBoundary": None, "status": "UNRESOLVED"},
+        "quoteEvidence": {"status": quote["status"], "reason": quote["reason"], "rawResponse": quote["rawResponse"]},
         "provenance": {"provider": "TradeLocker", "owner": "AI Trading Bridge",
-                       "acquisition": "authenticated_history", "reconnaissanceOnly": True},
+                       "acquisition": ["authenticated_quote", "authenticated_history"], "reconnaissanceOnly": True},
     }
 
 

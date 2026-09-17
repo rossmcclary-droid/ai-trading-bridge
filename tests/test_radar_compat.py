@@ -60,3 +60,43 @@ def test_radar_payload_contains_no_credential_fields():
     text = str(result).lower()
     for forbidden in ("password", "access_token", "authorization", "developer_api_key", "secret_blob"):
         assert forbidden not in text
+
+
+def test_tradelocker_quote_uses_info_route_and_preserves_raw_response():
+    class Response:
+        def raise_for_status(self): pass
+        def json(self): return {"d": {"opaque": [1, 2, 3]}}
+    class Client:
+        def __init__(self): self.call = None
+        def get(self, url, params=None, headers=None):
+            self.call = (url, params, headers)
+            return Response()
+    broker = object.__new__(server.TradeLockerBroker)
+    broker.base = "https://example.invalid/backend-api"
+    broker.client = Client()
+    broker.token = "test-token"
+    broker.creds = {}
+    account = {"acc_num": "123"}
+    instrument = {"infoRouteId": 44, "tradableInstrumentId": 55, "tradeRouteId": 99}
+    out = broker.quote_raw(account, instrument)
+    assert out == {"d": {"opaque": [1, 2, 3]}}
+    _, params, headers = broker.client.call
+    assert params == {"routeId": 44, "tradableInstrumentId": 55}
+    assert params["routeId"] != instrument["tradeRouteId"]
+    assert headers["accNum"] == "123"
+
+
+def test_quote_projection_preserves_evidence_without_guessing_bid_ask(monkeypatch):
+    account = {"id": "real", "platform": "TradeLocker", "connection_id": "c"}
+    instrument = {"symbol": "XAUUSD"}
+    class FakeBroker:
+        def quote_raw(self, *args): return {"mysteryBidLike": 2400, "mysteryAskLike": 2401}
+        def candles(self, *args, **kwargs): return []
+    monkeypatch.setattr(server, "broker_for", lambda _: FakeBroker())
+    monkeypatch.setattr(server, "all_accounts", lambda: [account])
+    monkeypatch.setattr(server, "instruments_for", lambda _: [instrument])
+    result = server.radar_observation("XAUUSD", "real")
+    assert result["quoteEvidence"]["rawResponse"] == {"mysteryBidLike": 2400, "mysteryAskLike": 2401}
+    assert result["quoteEvidence"]["status"] == "QUESTIONABLE"
+    assert result["raw"]["bid"] is None
+    assert result["raw"]["ask"] is None

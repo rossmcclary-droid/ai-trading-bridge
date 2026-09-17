@@ -64,6 +64,7 @@ def test_radar_payload_contains_no_credential_fields():
 
 def test_tradelocker_quote_uses_info_route_and_preserves_raw_response():
     class Response:
+        status_code = 200
         def raise_for_status(self): pass
         def json(self): return {"d": {"opaque": [1, 2, 3]}}
     class Client:
@@ -148,6 +149,7 @@ def test_verified_quote_fields_map_ap_to_ask_and_bp_to_bid(monkeypatch):
 
 def test_authenticated_history_bar_details_normalizes_milliseconds():
     class Response:
+        status_code = 200
         def raise_for_status(self): pass
         def json(self): return {"s":"ok","d":{"barDetails":[{"t":1789614000000,"o":1,"h":2,"l":0.5,"c":1.5,"v":3}]}}
     class Client:

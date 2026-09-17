@@ -295,7 +295,7 @@ class TradeLockerBroker:
         return r.json()
 
     def instruments(self, account: dict[str, Any]) -> list[dict[str, Any]]:
-        r = self.client.get(f"{self.base}/trade/accounts/{account['account_id']}/instruments", headers=self._acc_headers(account)); r.raise_for_status()
+        r = self._info_get(f"{self.base}/trade/accounts/{account['account_id']}/instruments", headers=self._acc_headers(account)); r.raise_for_status()
         data = r.json(); raw = data.get("d") or data.get("instruments") or data
         if isinstance(raw, dict): raw = raw.get("instruments") or raw.get("data") or []
         out = []
@@ -315,11 +315,19 @@ class TradeLockerBroker:
             })
         return out
 
+    def _info_get(self, url: str, *, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None):
+        response = None
+        for attempt in range(4):
+            response = self.client.get(url, params=params, headers=headers)
+            if response.status_code != 429: return response
+            if attempt < 3: time.sleep(1.0)
+        return response
+
     def quote_raw(self, account: dict[str, Any], instrument: dict[str, Any]) -> dict[str, Any]:
         """Fetch the authenticated INFO-route quote payload without interpreting its schema."""
         params = {"routeId": instrument["infoRouteId"],
                   "tradableInstrumentId": instrument["tradableInstrumentId"]}
-        r = self.client.get(f"{self.base}/trade/quotes", params=params, headers=self._acc_headers(account))
+        r = self._info_get(f"{self.base}/trade/quotes", params=params, headers=self._acc_headers(account))
         r.raise_for_status()
         return r.json()
 
@@ -332,7 +340,7 @@ class TradeLockerBroker:
         to_ms = int(time.time() * 1000); from_ms = to_ms - seconds * count * 1000 * 2
         params = {"routeId": instrument["infoRouteId"], "from": from_ms, "to": to_ms,
                   "resolution": resolution, "tradableInstrumentId": instrument["tradableInstrumentId"]}
-        r = self.client.get(f"{self.base}/trade/history", params=params, headers=self._acc_headers(account)); r.raise_for_status()
+        r = self._info_get(f"{self.base}/trade/history", params=params, headers=self._acc_headers(account)); r.raise_for_status()
         data = r.json(); d = data.get("d") or data
         # TradeLocker authenticated history currently wraps row bars in d.barDetails.
         if isinstance(d, dict) and isinstance(d.get("barDetails"), list):
@@ -671,7 +679,10 @@ def _radar_quote_observation(broker: Any, account: dict[str, Any], instrument: d
     quote_raw = getattr(broker, "quote_raw", None)
     if quote_raw is None:
         return {"status": "UNAVAILABLE", "reason": "authenticated_quote_acquisition_unavailable", "rawResponse": None}
-    payload = quote_raw(account, instrument)
+    try:
+        payload = quote_raw(account, instrument)
+    except Exception as exc:
+        return {"status":"UNAVAILABLE","reason":f"authenticated_quote_unavailable:{type(exc).__name__}","bid":None,"ask":None,"rawResponse":None}
     d = payload.get("d") if isinstance(payload, dict) else None
     ap = d.get("ap") if isinstance(d, dict) else None
     bp = d.get("bp") if isinstance(d, dict) else None
@@ -687,7 +698,11 @@ def _radar_history_observation(account: dict[str, Any], instrument: dict[str, An
     broker = broker_for(account)
     if broker is None:
         return {"status": "UNAVAILABLE", "reason": "authenticated_bridge_acquisition_unavailable"}
-    rows = broker.candles(account, instrument, "1M_RADAR", 360)
+    try:
+        rows = broker.candles(account, instrument, "1M_RADAR", 360)
+    except Exception as exc:
+        return {"status":"UNAVAILABLE","reason":f"authenticated_history_unavailable:{type(exc).__name__}",
+                "sourceTimestamp":None,"freshnessSeconds":None,"price1HourAgo":None,"price4HoursAgo":None}
     completed = sorted((x for x in rows if x.get("time") is not None), key=lambda x: x["time"])
     now_s = int(time.time())
     completed = [x for x in completed if int(x["time"]) + 60 <= now_s]

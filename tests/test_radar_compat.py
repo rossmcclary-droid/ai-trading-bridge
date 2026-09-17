@@ -204,3 +204,13 @@ def test_info_get_rate_limit_retry_is_bounded(monkeypatch):
     out=b._info_get('https://example.invalid')
     assert out.status_code == 429 and b.client.calls == 3
     assert sleeps == [0.25,0.5]
+
+def test_tradelocker_http_timeout_is_bounded(monkeypatch):
+    seen={}
+    class C:
+        def __init__(self,timeout): seen['timeout']=timeout
+        def post(self,*args,**kwargs): raise RuntimeError('stop before credentials')
+    monkeypatch.setattr(server.httpx,'Client',C)
+    try: server.TradeLockerBroker({'environment':'DEMO','email':'x','password':'y','server':'z'})
+    except RuntimeError: pass
+    assert seen['timeout'] == 8.0

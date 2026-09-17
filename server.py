@@ -251,7 +251,7 @@ class TradeLockerBroker:
         self.creds = creds
         env = creds.get("environment", "DEMO").upper()
         self.base = "https://demo.tradelocker.com/backend-api" if env == "DEMO" else "https://live.tradelocker.com/backend-api"
-        self.client = httpx.Client(timeout=25.0)
+        self.client = httpx.Client(timeout=8.0)
         self.token = creds.get("access_token")
         if not self.token:
             self._login()

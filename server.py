@@ -317,12 +317,9 @@ class TradeLockerBroker:
         return out
 
     def _info_get(self, url: str, *, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None):
-        response = None
-        for attempt in range(3):
-            response = self.client.get(url, params=params, headers=headers)
-            if response.status_code != 429: return response
-            if attempt < 2: time.sleep(0.25 * (attempt + 1))
-        return response
+        # Do not amplify broker throttling with immediate retries. Radar's universe scheduler
+        # observes 429-derived UNAVAILABLE evidence and backs off subsequent acquisition.
+        return self.client.get(url, params=params, headers=headers)
 
     def quote_raw(self, account: dict[str, Any], instrument: dict[str, Any]) -> dict[str, Any]:
         """Fetch the authenticated INFO-route quote payload without interpreting its schema."""
@@ -690,7 +687,7 @@ def _radar_quote_observation(broker: Any, account: dict[str, Any], instrument: d
     try:
         payload = quote_raw(account, instrument)
     except Exception as exc:
-        return {"status":"UNAVAILABLE","reason":f"authenticated_quote_unavailable:{type(exc).__name__}","bid":None,"ask":None,"rawResponse":None}
+        return {"status":"UNAVAILABLE","reason":f"authenticated_quote_{'rate_limited' if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429 else 'unavailable:' + type(exc).__name__}","bid":None,"ask":None,"rawResponse":None}
     d = payload.get("d") if isinstance(payload, dict) else None
     ap = d.get("ap") if isinstance(d, dict) else None
     bp = d.get("bp") if isinstance(d, dict) else None
@@ -715,7 +712,7 @@ def _radar_history_observation(account: dict[str, Any], instrument: dict[str, An
             _RADAR_HISTORY_LAST_REQUEST = time.monotonic()
         rows = broker.candles(account, instrument, "1M_RADAR", 360)
     except Exception as exc:
-        return {"status":"UNAVAILABLE","reason":f"authenticated_history_unavailable:{type(exc).__name__}",
+        return {"status":"UNAVAILABLE","reason":f"authenticated_history_{'rate_limited' if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429 else 'unavailable:' + type(exc).__name__}",
                 "sourceTimestamp":None,"freshnessSeconds":None,"price1HourAgo":None,"price4HoursAgo":None}
     completed = sorted((x for x in rows if x.get("time") is not None), key=lambda x: x["time"])
     now_s = int(time.time())

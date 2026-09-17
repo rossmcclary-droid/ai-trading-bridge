@@ -192,3 +192,4 @@ def test_radar_observation_cache_avoids_repeat_broker_reads(monkeypatch):
     first=server.radar_observation("XAUUSD","real"); second=server.radar_observation("XAUUSD","real")
     assert first == second
     assert b.quotes == 1 and b.histories == 1
+    assert server.RADAR_OBSERVATION_CACHE_SECONDS == 300.0

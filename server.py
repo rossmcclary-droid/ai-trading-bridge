@@ -497,7 +497,7 @@ def set_active(account_id: str) -> dict[str,Any]:
 _BROKER_CACHE: dict[str, Broker] = {}
 _INSTRUMENT_CACHE: dict[str, list[dict[str, Any]]] = {}
 _RADAR_OBSERVATION_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
-RADAR_OBSERVATION_CACHE_SECONDS = 45.0
+RADAR_OBSERVATION_CACHE_SECONDS = 300.0
 
 def broker_for(account: dict[str,Any]) -> Broker | None:
     if account["id"].startswith("sim-"): return None

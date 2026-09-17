@@ -190,7 +190,9 @@ def test_radar_observation_cache_avoids_repeat_broker_reads(monkeypatch):
     b=B(); server._RADAR_OBSERVATION_CACHE.clear()
     monkeypatch.setattr(server,"all_accounts",lambda:[account]); monkeypatch.setattr(server,"instruments_for",lambda _:[instrument]); monkeypatch.setattr(server,"broker_for",lambda _:b)
     first=server.radar_observation("XAUUSD","real"); second=server.radar_observation("XAUUSD","real")
-    assert first == second
+    assert first["raw"] == second["raw"]
+    assert first["quality"]["status"] == second["quality"]["status"]
+    assert second["quality"]["freshnessSeconds"] >= first["quality"]["freshnessSeconds"]
     assert b.quotes == 1 and b.histories == 1
     assert server.RADAR_OBSERVATION_CACHE_SECONDS == 300.0
 
@@ -237,3 +239,28 @@ def test_partial_quote_failure_cannot_be_labeled_current(monkeypatch):
     out=server.radar_observation('XAUUSD','real')
     assert out['quality']['status']=='UNAVAILABLE'
     assert out['raw']['bid'] is None and out['raw']['price1HourAgo'] is not None
+
+def test_forced_refresh_bypasses_observation_cache(monkeypatch):
+    account={"id":"real","platform":"TradeLocker","connection_id":"c"}; instrument={"symbol":"XAUUSD"}
+    class B:
+        quotes=0; histories=0
+        def quote_raw(self,*args): self.quotes+=1; return {"d":{"ap":2.0,"bp":1.0}}
+        def candles(self,*args,**kwargs):
+            self.histories+=1; now=int(server.time.time())
+            return [{"time":now-(300-i)*60,"o":1,"h":2,"l":0.5,"c":1.5,"v":1} for i in range(300)]
+    b=B(); server._RADAR_OBSERVATION_CACHE.clear(); monkeypatch.setattr(server,"RADAR_HISTORY_MIN_INTERVAL_SECONDS",0)
+    monkeypatch.setattr(server,"all_accounts",lambda:[account]); monkeypatch.setattr(server,"instruments_for",lambda _:[instrument]); monkeypatch.setattr(server,"broker_for",lambda _:b)
+    server.radar_observation("XAUUSD","real"); server.radar_observation("XAUUSD","real",force_refresh=True)
+    assert b.quotes == 2 and b.histories == 2
+
+def test_cached_current_ages_to_stale(monkeypatch):
+    server._RADAR_OBSERVATION_CACHE.clear()
+    payload={"symbol":"XAUUSD","raw":{},"quality":{"status":"CURRENT","freshnessSeconds":1,"reason":"fresh"}}
+    server._RADAR_OBSERVATION_CACHE[("real","XAUUSD")]=(100.0,payload)
+    monkeypatch.setattr(server.time,"monotonic",lambda:300.0)
+    out=server.radar_observation("XAUUSD","real")
+    assert out["quality"]["status"] == "STALE"
+    assert out["quality"]["freshnessSeconds"] == 201.0
+
+def test_history_pacing_is_below_authenticated_route_limit():
+    assert server.RADAR_HISTORY_MIN_INTERVAL_SECONDS >= 1/3

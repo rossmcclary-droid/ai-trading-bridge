@@ -7,6 +7,7 @@ import math
 import os
 import random
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -498,6 +499,11 @@ _BROKER_CACHE: dict[str, Broker] = {}
 _INSTRUMENT_CACHE: dict[str, list[dict[str, Any]]] = {}
 _RADAR_OBSERVATION_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 RADAR_OBSERVATION_CACHE_SECONDS = 300.0
+# Authenticated /trade/config reports QUOTES_HISTORY at 3 requests/second.
+# Radar uses 0.36s spacing (2.78/s) to remain below that read-only route ceiling.
+RADAR_HISTORY_MIN_INTERVAL_SECONDS = 0.36
+_RADAR_HISTORY_LOCK = threading.Lock()
+_RADAR_HISTORY_LAST_REQUEST = 0.0
 
 def broker_for(account: dict[str,Any]) -> Broker | None:
     if account["id"].startswith("sim-"): return None
@@ -701,6 +707,12 @@ def _radar_history_observation(account: dict[str, Any], instrument: dict[str, An
     if broker is None:
         return {"status": "UNAVAILABLE", "reason": "authenticated_bridge_acquisition_unavailable"}
     try:
+        global _RADAR_HISTORY_LAST_REQUEST
+        with _RADAR_HISTORY_LOCK:
+            wait = RADAR_HISTORY_MIN_INTERVAL_SECONDS - (time.monotonic() - _RADAR_HISTORY_LAST_REQUEST)
+            if wait > 0:
+                time.sleep(wait)
+            _RADAR_HISTORY_LAST_REQUEST = time.monotonic()
         rows = broker.candles(account, instrument, "1M_RADAR", 360)
     except Exception as exc:
         return {"status":"UNAVAILABLE","reason":f"authenticated_history_unavailable:{type(exc).__name__}",
@@ -727,13 +739,21 @@ def _radar_history_observation(account: dict[str, Any], instrument: dict[str, An
     }
 
 
-def radar_observation(symbol: str, account_id: str | None = None) -> dict[str, Any]:
+def radar_observation(symbol: str, account_id: str | None = None, force_refresh: bool = False) -> dict[str, Any]:
     resolved_account_id = account_id or active_account()["id"]
     cache_key = (resolved_account_id, symbol)
     cached = _RADAR_OBSERVATION_CACHE.get(cache_key)
     now = time.monotonic()
-    if cached and now - cached[0] <= RADAR_OBSERVATION_CACHE_SECONDS:
-        return cached[1]
+    if cached and not force_refresh and now - cached[0] <= RADAR_OBSERVATION_CACHE_SECONDS:
+        age = now - cached[0]
+        result = json.loads(json.dumps(cached[1]))
+        q = result.get("quality", {})
+        if isinstance(q.get("freshnessSeconds"), (int, float)):
+            q["freshnessSeconds"] += age
+            if q["freshnessSeconds"] > 180 and q.get("status") == "CURRENT":
+                q["status"] = "STALE"
+                q["reason"] = "cached_authenticated_observation_exceeds_freshness_threshold"
+        return result
     account = next((x for x in all_accounts() if x["id"] == resolved_account_id), None)
     if not account:
         raise HTTPException(404, "Account not found")
@@ -778,8 +798,8 @@ def api_radar_instruments(account_id: str | None = None):
 
 
 @app.get("/api/radar/v0/observations")
-def api_radar_observations(symbol: str, account_id: str | None = None):
-    return radar_observation(symbol, account_id)
+def api_radar_observations(symbol: str, account_id: str | None = None, refresh: bool = False):
+    return radar_observation(symbol, account_id, force_refresh=refresh)
 
 
 @app.get("/api/strategy/status")

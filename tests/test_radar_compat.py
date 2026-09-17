@@ -100,3 +100,33 @@ def test_quote_projection_preserves_evidence_without_guessing_bid_ask(monkeypatc
     assert result["quoteEvidence"]["status"] == "QUESTIONABLE"
     assert result["raw"]["bid"] is None
     assert result["raw"]["ask"] is None
+
+
+def test_bridge_ui_defers_app_script_until_connection_form_exists():
+    html = Path("index.html").read_text()
+    assert '<script src="app.js" defer></script>' in html
+    assert 'id="tlConnectForm"' in html
+
+
+def test_validation_ui_cache_version_bumped_for_form_fix():
+    sw = Path("service-worker.js").read_text()
+    assert "ai-trading-bridge-v13-radar-validation-1" in sw
+
+
+def test_connection_form_has_no_native_get_fallback():
+    html = Path("index.html").read_text()
+    start = html.index('<form id="tlConnectForm"')
+    end = html.index('</form>', start)
+    form = html[start:end]
+    assert 'method="get"' not in form.lower()
+    assert 'action=' not in form.lower()
+
+
+def test_connection_javascript_posts_credentials_in_json_body_only():
+    js = Path("app.js").read_text()
+    marker = "fetch('/api/connect/tradelocker'"
+    start = js.index(marker)
+    snippet = js[start:start + 350]
+    assert "method:'POST'" in snippet
+    assert "body:JSON.stringify(f)" in snippet
+    assert "?" not in snippet.split("fetch(", 1)[1].split(",", 1)[0]

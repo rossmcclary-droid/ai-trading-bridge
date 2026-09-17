@@ -37,7 +37,7 @@ def test_history_projection_never_synthesizes_quotes(monkeypatch):
     assert result["raw"]["ask"] is None
     assert result["raw"]["currentDayHigh"] is None
     assert result["raw"]["previousDayClose"] is None
-    assert result["quality"]["status"] == "MISSING"
+    assert result["quality"]["status"] == "UNAVAILABLE"
 
 
 def test_completed_history_lookbacks_are_deterministic(monkeypatch):
@@ -226,3 +226,14 @@ def test_unavailable_observation_is_not_cached(monkeypatch):
     monkeypatch.setattr(server,"all_accounts",lambda:[account]); monkeypatch.setattr(server,"instruments_for",lambda _:[instrument]); monkeypatch.setattr(server,"broker_for",lambda _:b)
     server.radar_observation("XAUUSD","real"); server.radar_observation("XAUUSD","real")
     assert b.calls == 2
+
+def test_partial_quote_failure_cannot_be_labeled_current(monkeypatch):
+    account={"id":"real","platform":"TradeLocker","connection_id":"c"}; instrument={"symbol":"XAUUSD"}
+    class B:
+        def quote_raw(self,*args): raise TimeoutError()
+        def candles(self,*args,**kwargs):
+            now=int(server.time.time()); return [{"time":now-(300-i)*60,"o":1,"h":2,"l":0.5,"c":1.5,"v":1} for i in range(300)]
+    server._RADAR_OBSERVATION_CACHE.clear(); monkeypatch.setattr(server,"all_accounts",lambda:[account]); monkeypatch.setattr(server,"instruments_for",lambda _:[instrument]); monkeypatch.setattr(server,"broker_for",lambda _:B())
+    out=server.radar_observation('XAUUSD','real')
+    assert out['quality']['status']=='UNAVAILABLE'
+    assert out['raw']['bid'] is None and out['raw']['price1HourAgo'] is not None

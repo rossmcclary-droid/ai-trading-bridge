@@ -750,7 +750,10 @@ def radar_observation(symbol: str, account_id: str | None = None) -> dict[str, A
     raw["price1HourAgo"] = hist.get("price1HourAgo")
     raw["price4HoursAgo"] = hist.get("price4HoursAgo")
     statuses = {quote.get("status"), hist.get("status")}
-    overall = "CURRENT" if statuses == {"CURRENT"} else ("QUESTIONABLE" if "QUESTIONABLE" in statuses else hist["status"])
+    if statuses == {"CURRENT"}: overall = "CURRENT"
+    elif "UNAVAILABLE" in statuses: overall = "UNAVAILABLE"
+    elif "MISSING" in statuses: overall = "MISSING"
+    else: overall = "QUESTIONABLE"
     result = {
         "symbol": symbol,
         "raw": raw,

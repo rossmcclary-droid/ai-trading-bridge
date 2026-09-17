@@ -31,21 +31,21 @@ def test_history_projection_never_synthesizes_quotes(monkeypatch):
     assert result["raw"]["ask"] is None
     assert result["raw"]["currentDayHigh"] is None
     assert result["raw"]["previousDayClose"] is None
-    assert result["quality"]["status"] == "QUESTIONABLE"
+    assert result["quality"]["status"] == "MISSING"
 
 
 def test_completed_history_lookbacks_are_deterministic(monkeypatch):
     account = {"id": "real", "platform": "TradeLocker", "connection_id": "c"}
     instrument = {"symbol": "XAUUSD"}
     now = 2_000_000_000
-    rows = [{"time": now - (6-i)*3600, "o": 100+i, "h": 101+i, "l": 99+i, "c": 100.5+i, "v": 1} for i in range(6)]
+    rows = [{"time": now - (300-i)*60, "o": 100+i, "h": 101+i, "l": 99+i, "c": 100.5+i, "v": 1} for i in range(300)]
     class FakeBroker:
         def candles(self, *args, **kwargs): return rows
     monkeypatch.setattr(server, "broker_for", lambda _: FakeBroker())
     monkeypatch.setattr(server.time, "time", lambda: now)
     out = server._radar_history_observation(account, instrument)
-    assert out["price1HourAgo"] == 105.5
-    assert out["price4HoursAgo"] == 102.5
+    assert out["price1HourAgo"] == 339.5
+    assert out["price4HoursAgo"] == 159.5
 
 
 def test_radar_routes_are_get_only():
@@ -130,3 +130,29 @@ def test_connection_javascript_posts_credentials_in_json_body_only():
     assert "method:'POST'" in snippet
     assert "body:JSON.stringify(f)" in snippet
     assert "?" not in snippet.split("fetch(", 1)[1].split(",", 1)[0]
+
+
+def test_verified_quote_fields_map_ap_to_ask_and_bp_to_bid(monkeypatch):
+    account = {"id":"real","platform":"TradeLocker","connection_id":"c"}
+    instrument = {"symbol":"XAUUSD"}
+    class FakeBroker:
+        def quote_raw(self,*args): return {"s":"ok","d":{"ap":4368.23,"bp":4368.02,"as":100,"bs":100}}
+        def candles(self,*args,**kwargs): return []
+    monkeypatch.setattr(server,"broker_for",lambda _:FakeBroker())
+    monkeypatch.setattr(server,"all_accounts",lambda:[account])
+    monkeypatch.setattr(server,"instruments_for",lambda _:[instrument])
+    out=server.radar_observation("XAUUSD","real")
+    assert out["raw"]["ask"] == 4368.23
+    assert out["raw"]["bid"] == 4368.02
+    assert out["quoteEvidence"]["status"] == "CURRENT"
+
+def test_authenticated_history_bar_details_normalizes_milliseconds():
+    class Response:
+        def raise_for_status(self): pass
+        def json(self): return {"s":"ok","d":{"barDetails":[{"t":1789614000000,"o":1,"h":2,"l":0.5,"c":1.5,"v":3}]}}
+    class Client:
+        def get(self,*args,**kwargs): return Response()
+    b=object.__new__(server.TradeLockerBroker); b.base="https://example.invalid"; b.client=Client(); b.token="test"; b.creds={}
+    rows=b.candles({"acc_num":"1"},{"infoRouteId":2,"tradableInstrumentId":3},"1H",8)
+    assert rows[0]["time"] == 1789614000
+    assert rows[0]["c"] == 1.5

@@ -324,20 +324,28 @@ class TradeLockerBroker:
         return r.json()
 
     def candles(self, account: dict[str, Any], instrument: dict[str, Any], tf: str, count: int = 120) -> list[dict[str, Any]]:
-        to_ms = int(time.time() * 1000); from_ms = to_ms - TF_SECONDS[tf] * count * 1000 * 2
+        def epoch_seconds(value: Any) -> int:
+            stamp = int(value)
+            return stamp // 1000 if stamp > 10_000_000_000 else stamp
+        seconds = 60 if tf == "1M_RADAR" else TF_SECONDS[tf]
+        resolution = "1m" if tf == "1M_RADAR" else TIMEFRAMES[tf]
+        to_ms = int(time.time() * 1000); from_ms = to_ms - seconds * count * 1000 * 2
         params = {"routeId": instrument["infoRouteId"], "from": from_ms, "to": to_ms,
-                  "resolution": TIMEFRAMES[tf], "tradableInstrumentId": instrument["tradableInstrumentId"]}
+                  "resolution": resolution, "tradableInstrumentId": instrument["tradableInstrumentId"]}
         r = self.client.get(f"{self.base}/trade/history", params=params, headers=self._acc_headers(account)); r.raise_for_status()
         data = r.json(); d = data.get("d") or data
-        # TradeLocker commonly returns column arrays. Support row objects too.
+        # TradeLocker authenticated history currently wraps row bars in d.barDetails.
+        if isinstance(d, dict) and isinstance(d.get("barDetails"), list):
+            d = d["barDetails"]
+        # Support legacy/alternate column-array payloads too.
         if isinstance(d, dict) and any(k in d for k in ("t", "time", "o", "open")):
             t = d.get("t") or d.get("time") or []
             o = d.get("o") or d.get("open") or []; h = d.get("h") or d.get("high") or []
             l = d.get("l") or d.get("low") or []; c = d.get("c") or d.get("close") or []
             v = d.get("v") or d.get("volume") or [0] * len(c)
-            return [{"time": t[i] if i < len(t) else i, "o": float(o[i]), "h": float(h[i]), "l": float(l[i]), "c": float(c[i]), "v": float(v[i] if i < len(v) else 0)} for i in range(min(len(o),len(h),len(l),len(c)))] [-count:]
+            return [{"time": epoch_seconds(t[i]) if i < len(t) else i, "o": float(o[i]), "h": float(h[i]), "l": float(l[i]), "c": float(c[i]), "v": float(v[i] if i < len(v) else 0)} for i in range(min(len(o),len(h),len(l),len(c)))] [-count:]
         rows = d if isinstance(d, list) else []
-        return [{"time": x.get("t") or x.get("time"), "o": float(x.get("o") or x.get("open")), "h": float(x.get("h") or x.get("high")), "l": float(x.get("l") or x.get("low")), "c": float(x.get("c") or x.get("close")), "v": float(x.get("v") or x.get("volume") or 0)} for x in rows][-count:]
+        return [{"time": epoch_seconds(x.get("t") or x.get("time")), "o": float(x.get("o") or x.get("open")), "h": float(x.get("h") or x.get("high")), "l": float(x.get("l") or x.get("low")), "c": float(x.get("c") or x.get("close")), "v": float(x.get("v") or x.get("volume") or 0)} for x in rows][-count:]
 
     def positions(self, account: dict[str, Any]) -> Any:
         r = self.client.get(f"{self.base}/trade/accounts/{account['account_id']}/positions", headers=self._acc_headers(account)); r.raise_for_status(); return r.json()
@@ -594,6 +602,16 @@ def api_select(req: SelectReq):
 def connect_tl(req: TLConnect):
     creds=req.model_dump(); env=req.environment.upper(); broker=TradeLockerBroker({**creds,"environment":env}); discovered=broker.list_accounts()
     if not discovered: raise HTTPException(400,"No TradeLocker accounts were discovered.")
+    with sqlite3.connect(DB_PATH) as c:
+        existing = None
+        for a in discovered:
+            existing = c.execute("SELECT id FROM accounts WHERE platform=? AND account_id=? AND acc_num=? AND environment=? ORDER BY rowid DESC LIMIT 1",
+                                 ("TradeLocker", str(a["account_id"]), str(a["acc_num"]), env)).fetchone()
+            if existing:
+                c.execute("UPDATE accounts SET active=0")
+                c.execute("UPDATE accounts SET active=1 WHERE id=?", (existing[0],))
+                c.commit()
+                return api_accounts()
     cid="tlc-"+uuid.uuid4().hex[:12]
     with sqlite3.connect(DB_PATH) as c:
         c.execute("INSERT INTO connections VALUES(?,?,?,?,?,?)",(cid,"TradeLocker",req.label,env,encrypt_json(creds),utcnow()))
@@ -646,29 +664,37 @@ def _radar_quote_observation(broker: Any, account: dict[str, Any], instrument: d
     if quote_raw is None:
         return {"status": "UNAVAILABLE", "reason": "authenticated_quote_acquisition_unavailable", "rawResponse": None}
     payload = quote_raw(account, instrument)
-    return {"status": "QUESTIONABLE", "reason": "quote_schema_mapping_unverified", "rawResponse": payload}
+    d = payload.get("d") if isinstance(payload, dict) else None
+    ap = d.get("ap") if isinstance(d, dict) else None
+    bp = d.get("bp") if isinstance(d, dict) else None
+    if isinstance(ap, (int, float)) and isinstance(bp, (int, float)) and ap >= bp:
+        return {"status": "CURRENT", "reason": "authenticated_quote_bid_ask_verified",
+                "bid": float(bp), "ask": float(ap), "rawResponse": payload}
+    return {"status": "QUESTIONABLE", "reason": "quote_schema_mapping_unverified",
+            "bid": None, "ask": None, "rawResponse": payload}
 
 
 def _radar_history_observation(account: dict[str, Any], instrument: dict[str, Any]) -> dict[str, Any]:
-    """Read-only Radar compatibility projection over verified Bridge history acquisition.
-
-    Deliberately does not synthesize quotes or assume broker session/day boundaries.
-    """
+    """Project genuine one-minute history into approximately 1h/4h-old observations."""
     broker = broker_for(account)
     if broker is None:
         return {"status": "UNAVAILABLE", "reason": "authenticated_bridge_acquisition_unavailable"}
-    rows = broker.candles(account, instrument, "1H", 8)
+    rows = broker.candles(account, instrument, "1M_RADAR", 360)
     completed = sorted((x for x in rows if x.get("time") is not None), key=lambda x: x["time"])
     now_s = int(time.time())
-    completed = [x for x in completed if int(x["time"]) + TF_SECONDS["1H"] <= now_s]
+    completed = [x for x in completed if int(x["time"]) + 60 <= now_s]
     latest = completed[-1] if completed else None
-    one = completed[-1] if completed else None
-    four = completed[-4] if len(completed) >= 4 else None
+    def at_age(age: int):
+        target = now_s - age
+        eligible = [x for x in completed if int(x["time"]) + 60 <= target]
+        return eligible[-1] if eligible else None
+    one = at_age(3600); four = at_age(14400)
     source_ts = latest.get("time") if latest else None
-    freshness = (now_s - int(source_ts)) if source_ts is not None else None
+    freshness = (now_s - (int(source_ts) + 60)) if source_ts is not None else None
+    complete = one is not None and four is not None
     return {
-        "status": "QUESTIONABLE" if latest else "MISSING",
-        "reason": "live_quote_and_session_day_semantics_unverified",
+        "status": "CURRENT" if complete and freshness is not None and freshness <= 180 else ("QUESTIONABLE" if complete else "MISSING"),
+        "reason": "authenticated_minute_history_lookbacks" if complete else "authenticated_history_lookbacks_missing",
         "sourceTimestamp": source_ts,
         "freshnessSeconds": freshness,
         "price1HourAgo": one.get("c") if one else None,
@@ -688,12 +714,16 @@ def radar_observation(symbol: str, account_id: str | None = None) -> dict[str, A
         "status": "UNAVAILABLE", "reason": "authenticated_bridge_acquisition_unavailable", "rawResponse": None}
     hist = _radar_history_observation(account, instrument)
     raw = {key: None for key in RADAR_REQUIRED_FIELDS}
+    raw["bid"] = quote.get("bid")
+    raw["ask"] = quote.get("ask")
     raw["price1HourAgo"] = hist.get("price1HourAgo")
     raw["price4HoursAgo"] = hist.get("price4HoursAgo")
+    statuses = {quote.get("status"), hist.get("status")}
+    overall = "CURRENT" if statuses == {"CURRENT"} else ("QUESTIONABLE" if "QUESTIONABLE" in statuses else hist["status"])
     return {
         "symbol": symbol,
         "raw": raw,
-        "quality": {"status": hist["status"], "reason": hist["reason"],
+        "quality": {"status": overall, "reason": hist["reason"],
                     "sourceTimestamp": hist.get("sourceTimestamp"), "freshnessSeconds": hist.get("freshnessSeconds")},
         "session": {"dayBoundary": None, "status": "UNRESOLVED"},
         "quoteEvidence": {"status": quote["status"], "reason": quote["reason"], "rawResponse": quote["rawResponse"]},

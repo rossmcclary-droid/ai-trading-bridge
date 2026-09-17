@@ -214,3 +214,15 @@ def test_tradelocker_http_timeout_is_bounded(monkeypatch):
     try: server.TradeLockerBroker({'environment':'DEMO','email':'x','password':'y','server':'z'})
     except RuntimeError: pass
     assert seen['timeout'] == 8.0
+
+
+def test_unavailable_observation_is_not_cached(monkeypatch):
+    account={"id":"real","platform":"TradeLocker","connection_id":"c"}; instrument={"symbol":"XAUUSD"}
+    class B:
+        calls=0
+        def quote_raw(self,*args): self.calls+=1; raise TimeoutError()
+        def candles(self,*args,**kwargs): raise TimeoutError()
+    b=B(); server._RADAR_OBSERVATION_CACHE.clear()
+    monkeypatch.setattr(server,"all_accounts",lambda:[account]); monkeypatch.setattr(server,"instruments_for",lambda _:[instrument]); monkeypatch.setattr(server,"broker_for",lambda _:b)
+    server.radar_observation("XAUUSD","real"); server.radar_observation("XAUUSD","real")
+    assert b.calls == 2

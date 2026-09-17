@@ -761,7 +761,8 @@ def radar_observation(symbol: str, account_id: str | None = None) -> dict[str, A
         "provenance": {"provider": "TradeLocker", "owner": "AI Trading Bridge",
                        "acquisition": ["authenticated_quote", "authenticated_history"], "reconnaissanceOnly": True},
     }
-    _RADAR_OBSERVATION_CACHE[cache_key] = (now, result)
+    if result["quality"]["status"] in ("CURRENT", "STALE", "QUESTIONABLE"):
+        _RADAR_OBSERVATION_CACHE[cache_key] = (now, result)
     return result
 
 

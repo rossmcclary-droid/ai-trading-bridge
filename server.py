@@ -496,6 +496,8 @@ def set_active(account_id: str) -> dict[str,Any]:
 
 _BROKER_CACHE: dict[str, Broker] = {}
 _INSTRUMENT_CACHE: dict[str, list[dict[str, Any]]] = {}
+_RADAR_OBSERVATION_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+RADAR_OBSERVATION_CACHE_SECONDS = 45.0
 
 def broker_for(account: dict[str,Any]) -> Broker | None:
     if account["id"].startswith("sim-"): return None
@@ -726,7 +728,13 @@ def _radar_history_observation(account: dict[str, Any], instrument: dict[str, An
 
 
 def radar_observation(symbol: str, account_id: str | None = None) -> dict[str, Any]:
-    account = next((x for x in all_accounts() if x["id"] == (account_id or active_account()["id"])), None)
+    resolved_account_id = account_id or active_account()["id"]
+    cache_key = (resolved_account_id, symbol)
+    cached = _RADAR_OBSERVATION_CACHE.get(cache_key)
+    now = time.monotonic()
+    if cached and now - cached[0] <= RADAR_OBSERVATION_CACHE_SECONDS:
+        return cached[1]
+    account = next((x for x in all_accounts() if x["id"] == resolved_account_id), None)
     if not account:
         raise HTTPException(404, "Account not found")
     instrument = next((x for x in instruments_for(account) if x["symbol"] == symbol), None)
@@ -743,7 +751,7 @@ def radar_observation(symbol: str, account_id: str | None = None) -> dict[str, A
     raw["price4HoursAgo"] = hist.get("price4HoursAgo")
     statuses = {quote.get("status"), hist.get("status")}
     overall = "CURRENT" if statuses == {"CURRENT"} else ("QUESTIONABLE" if "QUESTIONABLE" in statuses else hist["status"])
-    return {
+    result = {
         "symbol": symbol,
         "raw": raw,
         "quality": {"status": overall, "reason": hist["reason"],
@@ -753,6 +761,8 @@ def radar_observation(symbol: str, account_id: str | None = None) -> dict[str, A
         "provenance": {"provider": "TradeLocker", "owner": "AI Trading Bridge",
                        "acquisition": ["authenticated_quote", "authenticated_history"], "reconnaissanceOnly": True},
     }
+    _RADAR_OBSERVATION_CACHE[cache_key] = (now, result)
+    return result
 
 
 @app.get("/api/radar/v0/instruments")

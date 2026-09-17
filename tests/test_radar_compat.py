@@ -9,7 +9,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 server = importlib.import_module("server")
 
 
+def clear_radar_cache():
+    server._RADAR_OBSERVATION_CACHE.clear()
+
+
 def test_simulated_account_is_explicitly_unavailable():
+    clear_radar_cache()
     result = server.radar_observation("XAUUSD", "sim-tl-784215")
     assert result["quality"]["status"] == "UNAVAILABLE"
     assert all(value is None for value in result["raw"].values())
@@ -17,6 +22,7 @@ def test_simulated_account_is_explicitly_unavailable():
 
 
 def test_history_projection_never_synthesizes_quotes(monkeypatch):
+    clear_radar_cache()
     account = {"id": "real", "platform": "TradeLocker", "connection_id": "c"}
     instrument = {"symbol": "XAUUSD"}
     class FakeBroker:
@@ -88,6 +94,7 @@ def test_tradelocker_quote_uses_info_route_and_preserves_raw_response():
 
 
 def test_quote_projection_preserves_evidence_without_guessing_bid_ask(monkeypatch):
+    clear_radar_cache()
     account = {"id": "real", "platform": "TradeLocker", "connection_id": "c"}
     instrument = {"symbol": "XAUUSD"}
     class FakeBroker:
@@ -134,6 +141,7 @@ def test_connection_javascript_posts_credentials_in_json_body_only():
 
 
 def test_verified_quote_fields_map_ap_to_ask_and_bp_to_bid(monkeypatch):
+    clear_radar_cache()
     account = {"id":"real","platform":"TradeLocker","connection_id":"c"}
     instrument = {"symbol":"XAUUSD"}
     class FakeBroker:
@@ -170,3 +178,17 @@ def test_instrument_cache_avoids_repeated_broker_discovery(monkeypatch):
     assert server.instruments_for(account)==[{"symbol":"XAUUSD"}]
     assert len(calls)==1
     server._INSTRUMENT_CACHE.pop(account["id"],None)
+
+def test_radar_observation_cache_avoids_repeat_broker_reads(monkeypatch):
+    account={"id":"real","platform":"TradeLocker","connection_id":"c"}; instrument={"symbol":"XAUUSD"}
+    class B:
+        quotes=0; histories=0
+        def quote_raw(self,*args): self.quotes+=1; return {"d":{"ap":2.0,"bp":1.0}}
+        def candles(self,*args,**kwargs):
+            self.histories+=1; now=int(server.time.time())
+            return [{"time":now-(300-i)*60,"o":1,"h":2,"l":0.5,"c":1.5,"v":1} for i in range(300)]
+    b=B(); server._RADAR_OBSERVATION_CACHE.clear()
+    monkeypatch.setattr(server,"all_accounts",lambda:[account]); monkeypatch.setattr(server,"instruments_for",lambda _:[instrument]); monkeypatch.setattr(server,"broker_for",lambda _:b)
+    first=server.radar_observation("XAUUSD","real"); second=server.radar_observation("XAUUSD","real")
+    assert first == second
+    assert b.quotes == 1 and b.histories == 1

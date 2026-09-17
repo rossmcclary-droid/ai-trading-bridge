@@ -317,10 +317,10 @@ class TradeLockerBroker:
 
     def _info_get(self, url: str, *, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None):
         response = None
-        for attempt in range(4):
+        for attempt in range(3):
             response = self.client.get(url, params=params, headers=headers)
             if response.status_code != 429: return response
-            if attempt < 3: time.sleep(1.0)
+            if attempt < 2: time.sleep(0.25 * (attempt + 1))
         return response
 
     def quote_raw(self, account: dict[str, Any], instrument: dict[str, Any]) -> dict[str, Any]:

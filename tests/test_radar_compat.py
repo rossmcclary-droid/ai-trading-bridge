@@ -193,3 +193,14 @@ def test_radar_observation_cache_avoids_repeat_broker_reads(monkeypatch):
     assert first == second
     assert b.quotes == 1 and b.histories == 1
     assert server.RADAR_OBSERVATION_CACHE_SECONDS == 300.0
+
+def test_info_get_rate_limit_retry_is_bounded(monkeypatch):
+    class R: status_code=429
+    class C:
+        calls=0
+        def get(self,*args,**kwargs): self.calls+=1; return R()
+    sleeps=[]; monkeypatch.setattr(server.time,'sleep',lambda n:sleeps.append(n))
+    b=object.__new__(server.TradeLockerBroker); b.client=C()
+    out=b._info_get('https://example.invalid')
+    assert out.status_code == 429 and b.client.calls == 3
+    assert sleeps == [0.25,0.5]

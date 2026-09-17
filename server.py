@@ -486,18 +486,26 @@ def set_active(account_id: str) -> dict[str,Any]:
     return active_account()
 
 
+_BROKER_CACHE: dict[str, Broker] = {}
+_INSTRUMENT_CACHE: dict[str, list[dict[str, Any]]] = {}
+
 def broker_for(account: dict[str,Any]) -> Broker | None:
     if account["id"].startswith("sim-"): return None
+    cid = account["connection_id"]
+    if cid in _BROKER_CACHE: return _BROKER_CACHE[cid]
     with sqlite3.connect(DB_PATH) as c:
-        c.row_factory=sqlite3.Row; row=c.execute("SELECT * FROM connections WHERE id=?",(account["connection_id"],)).fetchone()
+        c.row_factory=sqlite3.Row; row=c.execute("SELECT * FROM connections WHERE id=?",(cid,)).fetchone()
     if not row: raise RuntimeError("Connection not found")
     creds=decrypt_json(row["secret_blob"]); creds["environment"]=row["environment"]
-    return TradeLockerBroker(creds) if row["platform"]=="TradeLocker" else MT5Broker(creds)
-
+    broker = TradeLockerBroker(creds) if row["platform"]=="TradeLocker" else MT5Broker(creds)
+    _BROKER_CACHE[cid] = broker
+    return broker
 
 def instruments_for(account: dict[str,Any]) -> list[dict[str,Any]]:
+    if account["id"] in _INSTRUMENT_CACHE: return _INSTRUMENT_CACHE[account["id"]]
     broker=broker_for(account)
-    if broker: return broker.instruments(account)
+    if broker:
+        rows = broker.instruments(account); _INSTRUMENT_CACHE[account["id"]] = rows; return rows
     return [{"symbol":s,"tradableInstrumentId":s,"infoRouteId":0,"tradeRouteId":0} for s in SIM_SYMBOLS.get(account["id"],[])]
 
 

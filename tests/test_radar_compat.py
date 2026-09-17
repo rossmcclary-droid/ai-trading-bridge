@@ -156,3 +156,15 @@ def test_authenticated_history_bar_details_normalizes_milliseconds():
     rows=b.candles({"acc_num":"1"},{"infoRouteId":2,"tradableInstrumentId":3},"1H",8)
     assert rows[0]["time"] == 1789614000
     assert rows[0]["c"] == 1.5
+
+def test_instrument_cache_avoids_repeated_broker_discovery(monkeypatch):
+    account={"id":"cache-test","connection_id":"cache-conn"}
+    calls=[]
+    class B:
+        def instruments(self,a): calls.append(1); return [{"symbol":"XAUUSD"}]
+    server._INSTRUMENT_CACHE.pop(account["id"],None)
+    monkeypatch.setattr(server,"broker_for",lambda _:B())
+    assert server.instruments_for(account)==[{"symbol":"XAUUSD"}]
+    assert server.instruments_for(account)==[{"symbol":"XAUUSD"}]
+    assert len(calls)==1
+    server._INSTRUMENT_CACHE.pop(account["id"],None)

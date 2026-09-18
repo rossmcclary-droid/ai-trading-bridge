@@ -1,0 +1,8 @@
+{
+  "correlation_token": "m002-bulletin-v1",
+  "mission_id": "MISSION-002",
+  "job_id": "m002-openai-worker-init-001",
+  "status": "RUNNING_NEW_MECHANISM_CLASS",
+  "steps_completed": 10,
+  "note": "non-secret"
+}

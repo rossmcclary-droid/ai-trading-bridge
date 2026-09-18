@@ -1,0 +1,187 @@
+"""TradeLocker instrument and route resolution.
+
+Resolves a strategy symbol such as XAUUSD into the broker-specific
+tradableInstrumentId and TRADE routeId.
+
+Read-only. No order submission occurs here.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+
+class TradeLockerResolutionError(ValueError):
+    """Raised when a broker instrument cannot be resolved safely."""
+
+
+@dataclass(frozen=True)
+class ResolvedTradeLockerInstrument:
+    requested_symbol: str
+    broker_symbol: str
+    tradable_instrument_id: int
+    route_id: int
+    info_route_id: int | None = None
+
+
+def _collect_instruments(value: Any) -> list[dict[str, Any]]:
+    """Recursively collect objects that look like TradeLocker instruments."""
+
+    found: list[dict[str, Any]] = []
+
+    if isinstance(value, dict):
+        if (
+            "tradableInstrumentId" in value
+            and isinstance(value.get("routes"), list)
+        ):
+            found.append(value)
+
+        for child in value.values():
+            found.extend(_collect_instruments(child))
+
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(_collect_instruments(child))
+
+    return found
+
+
+def _symbol_values(item: dict[str, Any]) -> list[str]:
+    values = []
+
+    for key in ("name", "localizedName", "symbol"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            values.append(value.strip().upper())
+
+    return values
+
+
+def resolve_tradelocker_instrument(
+    response: Any,
+    requested_symbol: str,
+) -> ResolvedTradeLockerInstrument:
+    """Resolve exact broker instrument + TRADE route for a symbol."""
+
+    symbol = requested_symbol.strip().upper()
+
+    if not symbol:
+        raise TradeLockerResolutionError("Symbol is required.")
+
+    instruments = _collect_instruments(response)
+
+    if not instruments:
+        raise TradeLockerResolutionError(
+            "TradeLocker returned no recognizable instrument metadata."
+        )
+
+    # Exact broker-symbol matches always win.
+    exact = [
+        item
+        for item in instruments
+        if symbol in _symbol_values(item)
+    ]
+
+    # Only fall back to suffixed variants when there is exactly one
+    # unambiguous candidate.
+    if exact:
+        candidates = exact
+    else:
+        variants = []
+
+        for item in instruments:
+            names = _symbol_values(item)
+
+            if any(
+                name.startswith(symbol + ".")
+                or name.startswith(symbol + "-")
+                or name.startswith(symbol + "_")
+                for name in names
+            ):
+                variants.append(item)
+
+        if len(variants) == 1:
+            candidates = variants
+        elif len(variants) > 1:
+            names = sorted({
+                name
+                for item in variants
+                for name in _symbol_values(item)
+            })
+
+            raise TradeLockerResolutionError(
+                "Multiple broker variants match "
+                f"{symbol}: {', '.join(names)}"
+            )
+        else:
+            raise TradeLockerResolutionError(
+                f"No TradeLocker instrument matched {symbol}."
+            )
+
+    item = candidates[0]
+
+    tradable_id = item.get("tradableInstrumentId")
+
+    if not isinstance(tradable_id, int) or tradable_id <= 0:
+        raise TradeLockerResolutionError(
+            f"{symbol} has no valid tradableInstrumentId."
+        )
+
+    trade_routes = [
+        route
+        for route in item.get("routes", [])
+        if isinstance(route, dict)
+        and str(route.get("type", "")).upper() == "TRADE"
+    ]
+
+    if len(trade_routes) != 1:
+        raise TradeLockerResolutionError(
+            f"{symbol} must have exactly one TRADE route."
+        )
+
+    route_id = trade_routes[0].get("id")
+
+    if not isinstance(route_id, int) or route_id <= 0:
+        raise TradeLockerResolutionError(
+            f"{symbol} has no valid TRADE routeId."
+        )
+
+    info_routes = [
+        route
+        for route in item.get("routes", [])
+        if isinstance(route, dict)
+        and str(route.get("type", "")).upper() == "INFO"
+    ]
+
+    info_route_id = None
+
+    if len(info_routes) == 1:
+        candidate_info_route_id = info_routes[0].get("id")
+
+        if (
+            isinstance(candidate_info_route_id, int)
+            and candidate_info_route_id > 0
+        ):
+            info_route_id = candidate_info_route_id
+
+    broker_symbol = next(
+        (
+            value
+            for value in (
+                item.get("name"),
+                item.get("localizedName"),
+                item.get("symbol"),
+            )
+            if isinstance(value, str) and value.strip()
+        ),
+        symbol,
+    )
+
+    return ResolvedTradeLockerInstrument(
+        requested_symbol=symbol,
+        broker_symbol=broker_symbol,
+        tradable_instrument_id=tradable_id,
+        route_id=route_id,
+        info_route_id=info_route_id,
+    )

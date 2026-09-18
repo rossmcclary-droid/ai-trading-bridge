@@ -1,0 +1,23 @@
+{
+  "grades": [
+    "A+",
+    "A",
+    "A-",
+    "B+",
+    "WATCH",
+    "REJECT"
+  ],
+  "minimum_executable_grade": "B+",
+  "executable_grades": [
+    "A+",
+    "A",
+    "A-",
+    "B+"
+  ],
+  "non_executable_grades": [
+    "WATCH",
+    "REJECT"
+  ],
+  "supersedes": "Bootstrap v2 A/B/C grading references only",
+  "all_other_bootstrap_v2_rules_remain_authoritative": true
+}

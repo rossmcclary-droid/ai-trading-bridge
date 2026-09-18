@@ -1,0 +1,227 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: API specification
+servers:
+  - url: /api
+    description: API base path
+tags:
+  - name: health
+    description: Health operations
+  - name: accounts
+    description: Read-only account metadata
+  - name: strategy
+    description: Read-only Trading Brain configuration metadata
+paths:
+  /health:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns service status and confirms read-only mode
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                 $ref: "#/components/schemas/HealthStatus"
+  /accounts:
+    get:
+      operationId: listAccounts
+      tags: [accounts]
+      summary: List accounts
+      description: Lists configured account metadata without credentials or trading operations
+      responses:
+        "200":
+          description: Configured accounts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Account"
+  /accounts/{nickname}:
+    get:
+      operationId: getAccount
+      tags: [accounts]
+      summary: Get an account by nickname
+      parameters:
+        - name: nickname
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Account metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+        "404":
+          description: Account not found
+  /accounts/{nickname}/connection-status:
+    get:
+      operationId: getAccountConnectionStatus
+      tags: [accounts]
+      summary: Get safe account connection status
+      description: Reports configuration presence without returning credentials or tokens
+      parameters:
+        - name: nickname
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Safe connection configuration status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectionStatus"
+        "404":
+          description: Account not found
+  /strategy:
+    get:
+      operationId: getStrategy
+      tags: [strategy]
+      summary: Get active strategy configuration metadata
+      description: Returns active Bootstrap v2 metadata and grading policy without strategy rules or execution capability
+      responses:
+        "200":
+          description: Active strategy configuration metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StrategyConfig"
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+        service:
+          type: string
+        mode:
+          type: string
+          enum: [read-only]
+      required:
+        - status
+        - service
+        - mode
+    Account:
+      type: object
+      properties:
+        internal_id:
+          type: string
+        nickname:
+          type: string
+        platform:
+          type: string
+          enum: [TradeLocker, Match-Trader]
+        environment:
+          type: string
+          enum: [Demo, Live]
+        broker:
+          type: string
+        external_account_id:
+          type: [string, "null"]
+        connection_status:
+          type: string
+          enum: [not_connected, connected]
+      required:
+        - internal_id
+        - nickname
+        - platform
+        - environment
+        - broker
+        - external_account_id
+        - connection_status
+    ConnectionStatus:
+      type: object
+      properties:
+        nickname:
+          type: string
+        platform:
+          type: string
+        environment:
+          type: string
+        provider:
+          type: string
+        configured:
+          type: boolean
+        missing_configuration:
+          type: array
+          items:
+            type: string
+        authentication_method:
+          type: string
+        google_sign_in_supported:
+          type: boolean
+        message:
+          type: string
+      required:
+        - nickname
+        - platform
+        - environment
+        - provider
+        - configured
+        - missing_configuration
+        - authentication_method
+        - google_sign_in_supported
+        - message
+    StrategyConfig:
+      type: object
+      properties:
+        bootstrap_name:
+          type: string
+          enum: [AI Trading Bridge Strategy Bootstrap v2]
+        version:
+          type: string
+          enum: [research_integrated_2026-08-24]
+        grading_override:
+          $ref: "#/components/schemas/GradingOverride"
+        metadata:
+          $ref: "#/components/schemas/StrategyMetadata"
+        full_strategy_rules_loaded:
+          type: boolean
+        full_strategy_rules:
+          type: "null"
+      required:
+        - bootstrap_name
+        - version
+        - grading_override
+        - metadata
+        - full_strategy_rules_loaded
+        - full_strategy_rules
+    GradingOverride:
+      type: object
+      properties:
+        grades:
+          type: array
+          items:
+            type: string
+            enum: [A+, A, A-, B+, WATCH, REJECT]
+          minItems: 6
+          maxItems: 6
+        minimum_executable_grade:
+          type: string
+          enum: [B+]
+      required:
+        - grades
+        - minimum_executable_grade
+    StrategyMetadata:
+      type: object
+      properties:
+        supersedes:
+          type: string
+        inheritance:
+          type: string
+      required:
+        - supersedes
+        - inheritance
+

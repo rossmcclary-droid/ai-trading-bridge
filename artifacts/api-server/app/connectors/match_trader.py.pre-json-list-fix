@@ -1,0 +1,476 @@
+"""Read-only Match-Trader Platform API connector.
+
+This connector intentionally implements observation-only broker access.
+It contains no create, update, cancel, close, or execute operations.
+"""
+
+import asyncio
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from http.cookies import SimpleCookie
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+from app.connectors.base import ReadOnlyConnector
+
+
+class MatchTraderConfigurationError(RuntimeError):
+    """Raised when Match-Trader configuration is incomplete."""
+
+
+class MatchTraderAPIError(RuntimeError):
+    """Raised when Match-Trader cannot complete a read request."""
+
+
+def _load_local_env() -> None:
+    """Load project-local .env values without overriding process env."""
+
+    env_path = Path(__file__).resolve().parents[2] / ".env"
+
+    if not env_path.is_file():
+        return
+
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
+
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+
+        if not key:
+            continue
+
+        if (
+            len(value) >= 2
+            and value[0] == value[-1]
+            and value[0] in {"'", '"'}
+        ):
+            value = value[1:-1]
+
+        os.environ.setdefault(key, value)
+
+
+@dataclass(frozen=True)
+class MatchTraderConfig:
+    """Match-Trader Platform API configuration."""
+
+    base_url: str
+    email: str
+    password: str
+    broker_id: str
+    account_id: str = ""
+
+    @classmethod
+    def from_environment(cls) -> "MatchTraderConfig":
+        _load_local_env()
+
+        return cls(
+            base_url=os.getenv(
+                "MATCH_TRADER_BASE_URL",
+                "https://mtr-demo-prod.match-trader.com",
+            ).rstrip("/"),
+            email=os.getenv("MATCH_TRADER_EMAIL", ""),
+            password=os.getenv("MATCH_TRADER_PASSWORD", ""),
+            broker_id=os.getenv("MATCH_TRADER_BROKER_ID", ""),
+            account_id=os.getenv("MATCH_TRADER_ACCOUNT_ID", ""),
+        )
+
+    def missing_required_values(self) -> list[str]:
+        """Return configuration variable names without exposing values."""
+
+        missing = []
+
+        if not self.base_url:
+            missing.append("MATCH_TRADER_BASE_URL")
+        if not self.email:
+            missing.append("MATCH_TRADER_EMAIL")
+        if not self.password:
+            missing.append("MATCH_TRADER_PASSWORD")
+        if not self.broker_id:
+            missing.append("MATCH_TRADER_BROKER_ID")
+
+        return missing
+
+
+class MatchTraderConnector(ReadOnlyConnector):
+    """Match-Trader Platform API client with no trade-write operations."""
+
+    provider = "match-trader"
+
+    def __init__(
+        self,
+        config: MatchTraderConfig | None = None,
+    ) -> None:
+        self.config = config or MatchTraderConfig.from_environment()
+        self._trading_api_token: str | None = None
+        self._co_auth_cookie: str | None = None
+        self._authenticated_payload: dict[str, Any] | None = None
+        self._selected_account: dict[str, Any] | None = None
+
+    def configuration_status(self) -> dict[str, Any]:
+        """Return safe configuration metadata without credential values."""
+
+        missing = self.config.missing_required_values()
+
+        return {
+            "configured": not missing,
+            "missing_configuration": missing,
+            "authentication_method": (
+                "Match-Trader Platform API co-login "
+                "(email, password, brokerId)"
+            ),
+            "message": (
+                "Match-Trader connector configuration is complete."
+                if not missing
+                else "Match-Trader connector configuration is incomplete."
+            ),
+        }
+
+    async def authenticate(self) -> dict[str, Any]:
+        """Authenticate through the Match-Trader Platform API."""
+
+        missing = self.config.missing_required_values()
+        if missing:
+            raise MatchTraderConfigurationError(
+                "Match-Trader Platform API configuration is incomplete: "
+                + ", ".join(missing)
+            )
+
+        try:
+            broker_id: int | str = int(self.config.broker_id)
+        except ValueError:
+            broker_id = self.config.broker_id
+
+        response = await self._request(
+            "POST",
+            "/manager/co-login",
+            body={
+                "email": self.config.email,
+                "password": self.config.password,
+                "brokerId": broker_id,
+            },
+            authenticated=False,
+        )
+
+        selected_account = self._select_account(response)
+
+        token = self._find_token(selected_account)
+        if not token:
+            raise MatchTraderAPIError(
+                "Selected Match-Trader account had no tradingApiToken"
+            )
+
+        self._trading_api_token = token
+        self._authenticated_payload = response
+        self._selected_account = selected_account
+
+        return {
+            "authenticated": True,
+            "provider": self.provider,
+            "account_data_available": bool(response),
+        }
+
+    async def get_accounts(self) -> list[dict[str, Any]]:
+        if not self._authenticated_payload:
+            await self.authenticate()
+
+        payload = self._authenticated_payload or {}
+
+        accounts = payload.get("accounts")
+        if isinstance(accounts, list):
+            return [
+                item
+                for item in accounts
+                if isinstance(item, dict)
+            ]
+
+        account = payload.get("account")
+        if isinstance(account, dict):
+            return [account]
+
+        return [payload] if payload else []
+
+    async def get_available_instruments(
+        self,
+        account_id: int,
+        acc_num: str,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            "Match-Trader instrument reads are not implemented yet"
+        )
+
+    async def get_account_state(
+        self,
+        account_id: int,
+        acc_num: str,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            "Match-Trader account-state reads are not implemented yet"
+        )
+
+    async def get_quotations(
+        self,
+        symbols: list[str],
+    ) -> dict[str, Any]:
+        """Read current Match-Trader quotations for selected symbols."""
+
+        if not symbols:
+            raise MatchTraderAPIError(
+                "At least one Match-Trader quotation symbol is required"
+            )
+
+        if not self._selected_account:
+            await self.authenticate()
+
+        account = self._selected_account or {}
+        offer = account.get("offer")
+        system = offer.get("system") if isinstance(offer, dict) else None
+        system_uuid = system.get("uuid") if isinstance(system, dict) else None
+
+        if not isinstance(system_uuid, str) or not system_uuid:
+            raise MatchTraderAPIError(
+                "Selected Match-Trader account has no offer.system.uuid"
+            )
+
+        cleaned_symbols = [
+            symbol.strip()
+            for symbol in symbols
+            if isinstance(symbol, str) and symbol.strip()
+        ]
+
+        if not cleaned_symbols:
+            raise MatchTraderAPIError(
+                "At least one valid Match-Trader quotation symbol is required"
+            )
+
+        return await self._request(
+            "GET",
+            f"/mtr-api/{system_uuid}/quotations",
+            query={"symbols": ",".join(cleaned_symbols)},
+        )
+
+    async def get_open_positions(
+        self,
+        account_id: int,
+        acc_num: str,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            "Match-Trader position reads are not implemented yet"
+        )
+
+    async def get_pending_orders(
+        self,
+        account_id: int,
+        acc_num: str,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            "Match-Trader pending-order reads are not implemented yet"
+        )
+
+    async def get_historical_candles(
+        self,
+        account_id: int,
+        acc_num: str,
+        tradable_instrument_id: int,
+        route_id: int,
+        resolution: str,
+        from_timestamp: int,
+        to_timestamp: int,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            "Match-Trader candle reads are not implemented yet"
+        )
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: dict[str, Any] | None = None,
+        query: dict[str, str] | None = None,
+        authenticated: bool = True,
+    ) -> dict[str, Any]:
+        url = f"{self.config.base_url}{path}"
+
+        if query:
+            url = f"{url}?{urlencode(query)}"
+
+        headers = {
+            "accept": "application/json",
+            "User-Agent": "AI-Trading-Bridge/1.0",
+        }
+
+        if body is not None:
+            headers["content-type"] = "application/json"
+
+        if authenticated:
+            if not self._trading_api_token or not self._co_auth_cookie:
+                await self.authenticate()
+
+            if not self._trading_api_token:
+                raise MatchTraderAPIError(
+                    "Match-Trader authenticated request has no tradingApiToken"
+                )
+
+            if not self._co_auth_cookie:
+                raise MatchTraderAPIError(
+                    "Match-Trader authenticated request has no co-auth cookie"
+                )
+
+            headers["Auth-trading-api"] = self._trading_api_token
+            headers["Cookie"] = f"co-auth={self._co_auth_cookie}"
+
+        request = Request(
+            url,
+            data=(
+                json.dumps(body).encode()
+                if body is not None
+                else None
+            ),
+            headers=headers,
+            method=method,
+        )
+
+        try:
+            payload, co_auth_cookie = await asyncio.to_thread(
+                self._open_json,
+                request,
+            )
+
+            if not authenticated and path == "/manager/co-login":
+                self._co_auth_cookie = co_auth_cookie
+
+            return payload
+
+        except HTTPError as error:
+            detail = None
+
+            try:
+                detail = error.read().decode(errors="replace")
+            except Exception:
+                pass
+
+            message = (
+                f"Match-Trader {method} {path} request failed "
+                f"(HTTP {error.code})"
+            )
+
+            if detail:
+                message += f": {detail[:500]}"
+
+            raise MatchTraderAPIError(message) from error
+
+        except (URLError, TimeoutError) as error:
+            raise MatchTraderAPIError(
+                f"Match-Trader {method} {path} request failed: "
+                f"{type(error).__name__}: {error}"
+            ) from error
+
+    @staticmethod
+    def _open_json(
+        request: Request,
+    ) -> tuple[dict[str, Any], str | None]:
+        with urlopen(request, timeout=30) as response:
+            payload = json.loads(
+                response.read().decode(errors="replace")
+            )
+
+            if not isinstance(payload, dict):
+                raise MatchTraderAPIError(
+                    "Match-Trader response was not a JSON object"
+                )
+
+            co_auth_cookie = None
+
+            for raw_cookie in response.headers.get_all("Set-Cookie", []):
+                parsed = SimpleCookie()
+                parsed.load(raw_cookie)
+
+                morsel = parsed.get("co-auth")
+                if morsel is not None:
+                    co_auth_cookie = morsel.value
+                    break
+
+            return payload, co_auth_cookie
+
+    def _select_account(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Select one login account deterministically."""
+
+        accounts = payload.get("accounts")
+
+        if not isinstance(accounts, list):
+            account = payload.get("account")
+            if isinstance(account, dict):
+                return account
+
+            raise MatchTraderAPIError(
+                "Match-Trader auth response contained no account list"
+            )
+
+        valid_accounts = [
+            item
+            for item in accounts
+            if isinstance(item, dict)
+        ]
+
+        if not valid_accounts:
+            raise MatchTraderAPIError(
+                "Match-Trader auth response contained no usable accounts"
+            )
+
+        configured_id = self.config.account_id.strip()
+
+        if configured_id:
+            for account in valid_accounts:
+                trading_account_id = account.get("tradingAccountId")
+                if (
+                    trading_account_id is not None
+                    and str(trading_account_id) == configured_id
+                ):
+                    return account
+
+            raise MatchTraderAPIError(
+                "Configured MATCH_TRADER_ACCOUNT_ID was not found "
+                "in the authenticated account list"
+            )
+
+        if len(valid_accounts) == 1:
+            return valid_accounts[0]
+
+        raise MatchTraderAPIError(
+            "Match-Trader login returned multiple accounts; "
+            "set MATCH_TRADER_ACCOUNT_ID to select one safely"
+        )
+
+    @staticmethod
+    def _find_token(payload: dict[str, Any]) -> str | None:
+        """Find tradingApiToken without exposing or logging it."""
+
+        direct = payload.get("tradingApiToken")
+        if isinstance(direct, str) and direct:
+            return direct
+
+        for value in payload.values():
+            if isinstance(value, dict):
+                token = MatchTraderConnector._find_token(value)
+                if token:
+                    return token
+
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        token = MatchTraderConnector._find_token(item)
+                        if token:
+                            return token
+
+        return None

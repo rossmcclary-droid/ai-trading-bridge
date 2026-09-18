@@ -1,0 +1,708 @@
+{
+  "top_level_keys": [
+    "account",
+    "account_risk_snapshot",
+    "atlas_context",
+    "bootstrap_runtime_status",
+    "bootstrap_runtime_verification",
+    "configured_bootstrap_sha256",
+    "current_exposure",
+    "data_source",
+    "diagnostics",
+    "export_completeness",
+    "external_ai_workflow",
+    "external_review_requirements",
+    "generated_at",
+    "instruments",
+    "market_discovery",
+    "match_trader_cross_reference",
+    "match_trader_sizing",
+    "match_trader_translation",
+    "persistent_alerts",
+    "purpose",
+    "request",
+    "risk_sized_execution_candidate",
+    "rr_audit",
+    "runtime_loaded_bootstrap_sha256",
+    "safety",
+    "scan_status",
+    "schema",
+    "side_by_side_order",
+    "timezone",
+    "watch_advisory",
+    "workflow_snapshot"
+  ],
+  "patch002dj_timings": null,
+  "per_symbol_timings": null,
+  "all_patch002dj_objects": [
+    {
+      "patch002_timings_ms": {
+        "stage_1_account_and_connector": 1124.45,
+        "stage_2_market_discovery": 20339.916,
+        "stage_3_scanner": 1449.646,
+        "stage_4_analysis": 3051.425,
+        "stage_5_payload_assembly": 0.031,
+        "stage_6_truth_layer": 0.018,
+        "stage_7_bootstrap_and_response": 0.248
+      },
+      "timing_clock": "perf_counter",
+      "patch002b_timings": {
+        "export_ai_scan_total_ms": 121772.777,
+        "market_discovery_parent_total_ms": 20339.894,
+        "market_discovery_substages_ms": {
+          "universe_instrument_acquisition_ms": 1124.35,
+          "quote_retrieval_gather_ms": 20338.131,
+          "shortlist_construction_ms": 0.861,
+          "filtering_normalization_ms": 0.0,
+          "resolver_spec_details_ms": 0.0,
+          "waits_retries_delays_ms": 0.0,
+          "other_discovery_ms": 0.0,
+          "account_instrument_resolution_ms": 1124.45
+        },
+        "per_symbol_timings": [
+          {
+            "symbol": "BTCUSD",
+            "total_ms": 1441.974,
+            "history_ms": null,
+            "analysis_ms": 1.853,
+            "timeframe_request_count": 4,
+            "retry_count": 0,
+            "history_network_ms": 0.0,
+            "history_delay_sleep_ms": 0.0,
+            "history_or_analysis_cpu_ms": 1.853
+          },
+          {
+            "symbol": "ETHUSD",
+            "total_ms": 1439.852,
+            "history_ms": null,
+            "analysis_ms": 0.794,
+            "timeframe_request_count": 4,
+            "retry_count": 0,
+            "history_network_ms": 0.0,
+            "history_delay_sleep_ms": 0.0,
+            "history_or_analysis_cpu_ms": 0.794
+          },
+          {
+            "symbol": "SOLUSD",
+            "total_ms": 0.002,
+            "history_ms": null,
+            "analysis_ms": 0.0,
+            "timeframe_request_count": 4,
+            "retry_count": 0
+          },
+          {
+            "symbol": "BNBUSD",
+            "total_ms": 1459.237,
+            "history_ms": null,
+            "analysis_ms": 0.867,
+            "timeframe_request_count": 4,
+            "retry_count": 0,
+            "history_network_ms": 0.0,
+            "history_delay_sleep_ms": 0.0,
+            "history_or_analysis_cpu_ms": 0.867
+          },
+          {
+            "symbol": "XRPUSD",
+            "total_ms": 0.001,
+            "history_ms": null,
+            "analysis_ms": 0.0,
+            "timeframe_request_count": 4,
+            "retry_count": 0
+          },
+          {
+            "symbol": "XMRUSD",
+            "total_ms": 0.001,
+            "history_ms": null,
+            "analysis_ms": 0.0,
+            "timeframe_request_count": 4,
+            "retry_count": 0
+          },
+          {
+            "symbol": "XLMUSD",
+            "total_ms": 0.0,
+            "history_ms": null,
+            "analysis_ms": 0.0,
+            "timeframe_request_count": 4,
+            "retry_count": 0
+          },
+          {
+            "symbol": "ZECUSD",
+            "total_ms": 0.0,
+            "history_ms": null,
+            "analysis_ms": 0.0,
+            "timeframe_request_count": 4,
+            "retry_count": 0
+          },
+          {
+            "symbol": "DASHUSD",
+            "total_ms": 1449.645,
+            "history_ms": null,
+            "analysis_ms": 1.073,
+            "timeframe_request_count": 4,
+            "retry_count": 0,
+            "history_network_ms": 0.0,
+            "history_delay_sleep_ms": 0.0,
+            "history_or_analysis_cpu_ms": 1.073
+          },
+          {
+            "symbol": "DOGEUSD",
+            "total_ms": 3051.408,
+            "history_ms": null,
+            "analysis_ms": 1.036,
+            "timeframe_request_count": 4,
+            "retry_count": 0,
+            "history_network_ms": 0.0,
+            "history_delay_sleep_ms": 0.0,
+            "history_or_analysis_cpu_ms": 1.036
+          }
+        ],
+        "per_symbol_aggregate": {
+          "sum_ms": 8842.12,
+          "max_ms": 3051.408,
+          "slowest_symbol": "DOGEUSD",
+          "execution_mode": "serial"
+        },
+        "shortlist_raw_count": 10,
+        "shortlist_unique_count": 10,
+        "duplicate_symbols": [],
+        "duplicate_processing": {},
+        "job_creation_to_task_start_ms": 107.446,
+        "async_schedule_wait_ms": 107.446,
+        "wrapper_pre_export_ms": 0.008,
+        "post_export_write_prepare_ms": 10.543,
+        "job_state_finalization_ms": 0.028,
+        "total_created_to_ready_ms": 121890.937
+      },
+      "patch002c_timings": {
+        "wall": {
+          "created_to_ready_ms": 121764.169,
+          "export_ai_scan_ms": 121764.169,
+          "queue_ms": 0.0,
+          "scope": "in-process export; READY boundary unavailable"
+        },
+        "non_overlapping_export_buckets": [
+          {
+            "name": "market_discovery",
+            "ms": 22587.792
+          },
+          {
+            "name": "scanner_per_symbol",
+            "ms": 1449.646
+          },
+          {
+            "name": "analysis_enrichment_sizing_truth_bootstrap_serialize",
+            "ms": 97726.731
+          }
+        ],
+        "discovery_substages": [
+          {
+            "name": "universe_instrument_acquisition_ms",
+            "ms": 1124.35
+          },
+          {
+            "name": "quote_retrieval_gather_ms",
+            "ms": 20338.131
+          },
+          {
+            "name": "shortlist_construction_ms",
+            "ms": 0.861
+          },
+          {
+            "name": "filtering_normalization_ms",
+            "ms": 0.0
+          },
+          {
+            "name": "resolver_spec_details_ms",
+            "ms": 0.0
+          },
+          {
+            "name": "waits_retries_delays_ms",
+            "ms": 0.0
+          },
+          {
+            "name": "other_discovery_ms",
+            "ms": 0.0
+          },
+          {
+            "name": "account_instrument_resolution_ms",
+            "ms": 1124.45
+          }
+        ],
+        "quote_gather": {
+          "n_tasks": 19,
+          "gather_wall_ms": 20338.131,
+          "failures": 0
+        },
+        "per_symbol": [
+          {
+            "symbol": "BTCUSD",
+            "total_ms": 1441.974,
+            "history_ms": null,
+            "analysis_ms": 1.853,
+            "timeframe_request_count": 4,
+            "retry_count": 0,
+            "history_network_ms": 0.0,
+            "history_delay_sleep_ms": 0.0,
+            "history_or_analysis_cpu_ms": 1.853
+          },
+          {
+            "symbol": "ETHUSD",
+            "total_ms": 1439.852,
+            "history_ms": null,
+            "analysis_ms": 0.794,
+            "timeframe_request_count": 4,
+            "retry_count": 0,
+            "history_network_ms": 0.0,
+            "history_delay_sleep_ms": 0.0,
+            "history_or_analysis_cpu_ms": 0.794
+          },
+          {
+            "symbol": "SOLUSD",
+            "total_ms": 0.002,
+            "history_ms": null,
+            "analysis_ms": 0.0,
+            "timeframe_request_count": 4,
+            "retry_count": 0
+          },
+          {
+            "symbol": "BNBUSD",
+            "total_ms": 1459.237,
+            "history_ms": null,
+            "analysis_ms": 0.867,
+            "timeframe_request_count": 4,
+            "retry_count": 0,
+            "history_network_ms": 0.0,
+            "history_delay_sleep_ms": 0.0,
+            "history_or_analysis_cpu_ms": 0.867
+          },
+          {
+            "symbol": "XRPUSD",
+            "total_ms": 0.001,
+            "history_ms": null,
+            "analysis_ms": 0.0,
+            "timeframe_request_count": 4,
+            "retry_count": 0
+          },
+          {
+            "symbol": "XMRUSD",
+            "total_ms": 0.001,
+            "history_ms": null,
+            "analysis_ms": 0.0,
+            "timeframe_request_count": 4,
+            "retry_count": 0
+          },
+          {
+            "symbol": "XLMUSD",
+            "total_ms": 0.0,
+            "history_ms": null,
+            "analysis_ms": 0.0,
+            "timeframe_request_count": 4,
+            "retry_count": 0
+          },
+          {
+            "symbol": "ZECUSD",
+            "total_ms": 0.0,
+            "history_ms": null,
+            "analysis_ms": 0.0,
+            "timeframe_request_count": 4,
+            "retry_count": 0
+          },
+          {
+            "symbol": "DASHUSD",
+            "total_ms": 1449.645,
+            "history_ms": null,
+            "analysis_ms": 1.073,
+            "timeframe_request_count": 4,
+            "retry_count": 0,
+            "history_network_ms": 0.0,
+            "history_delay_sleep_ms": 0.0,
+            "history_or_analysis_cpu_ms": 1.073
+          },
+          {
+            "symbol": "DOGEUSD",
+            "total_ms": 3051.408,
+            "history_ms": null,
+            "analysis_ms": 1.036,
+            "timeframe_request_count": 4,
+            "retry_count": 0,
+            "history_network_ms": 0.0,
+            "history_delay_sleep_ms": 0.0,
+            "history_or_analysis_cpu_ms": 1.036
+          }
+        ],
+        "aggregates": {
+          "sum_ms": 8842.12,
+          "max_ms": 3051.408,
+          "slowest_ms": 3051.408,
+          "execution_mode": "sequential scan loop"
+        },
+        "duplicates": {
+          "raw": 10,
+          "unique": 10,
+          "dups": [],
+          "list_build": "requested_symbols/market_discovery shortlist"
+        },
+        "residual_ms": 99176.377,
+        "residual_pct": 81.45,
+        "attributed_pct_of_created_to_ready": 100.0,
+        "measurement_only": true
+      },
+      "patch002d_timings": {
+        "schema": "patch002d",
+        "measurement_only": true,
+        "wall_created_to_ready_ms": 121764.331,
+        "top_level": [
+          {
+            "name": "stage_1_account_and_connector",
+            "ms": 1124.45,
+            "nested": false
+          },
+          {
+            "name": "stage_2_market_discovery",
+            "ms": 20339.916,
+            "nested": false
+          },
+          {
+            "name": "stage_3_scanner",
+            "ms": 1449.646,
+            "nested": false
+          },
+          {
+            "name": "stage_4_analysis",
+            "ms": 3051.425,
+            "nested": false
+          },
+          {
+            "name": "stage_5_payload_assembly",
+            "ms": 0.031,
+            "nested": false
+          },
+          {
+            "name": "stage_6_truth_layer",
+            "ms": 0.018,
+            "nested": false
+          },
+          {
+            "name": "stage_7_bootstrap_and_response",
+            "ms": 0.248,
+            "nested": false
+          }
+        ],
+        "top_level_non_overlapping": true,
+        "top_level_sum_ms": 25965.734,
+        "top_level_coverage_pct": 21.325,
+        "mega_bucket_split": [
+          {
+            "name": "account_instrument_detail_lookup",
+            "ms": 1124.45,
+            "nested": true
+          },
+          {
+            "name": "other_discovery",
+            "ms": 20339.916,
+            "nested": true
+          },
+          {
+            "name": "candidate_analysis",
+            "ms": 3051.425,
+            "nested": true
+          },
+          {
+            "name": "payload_assembly",
+            "ms": 0.031,
+            "nested": true
+          },
+          {
+            "name": "truth_layer",
+            "ms": 0.018,
+            "nested": true
+          },
+          {
+            "name": "bootstrap_status",
+            "ms": 0.248,
+            "nested": true
+          }
+        ],
+        "other_discovery_split": [
+          {
+            "name": "universe_instrument_acquisition_ms",
+            "ms": 1124.35,
+            "nested": true
+          },
+          {
+            "name": "quote_retrieval_gather_ms",
+            "ms": 20338.131,
+            "nested": true
+          },
+          {
+            "name": "shortlist_construction_ms",
+            "ms": 0.861,
+            "nested": true
+          },
+          {
+            "name": "filtering_normalization_ms",
+            "ms": 0.0,
+            "nested": true
+          },
+          {
+            "name": "resolver_spec_details_ms",
+            "ms": 0.0,
+            "nested": true
+          },
+          {
+            "name": "waits_retries_delays_ms",
+            "ms": 0.0,
+            "nested": true
+          },
+          {
+            "name": "other_discovery_ms",
+            "ms": 0.0,
+            "nested": true
+          },
+          {
+            "name": "account_instrument_resolution_ms",
+            "ms": 1124.45,
+            "nested": true
+          }
+        ],
+        "quote": {
+          "n_tasks": 24,
+          "gather_wall_ms": 20338.131,
+          "task_elapsed_ms": [
+            1435.032,
+            1439.307,
+            1440.507,
+            1452.244,
+            1462.247,
+            1529.011,
+            2868.573,
+            2873.802,
+            2879.167,
+            2895.825,
+            2897.486,
+            2962.332,
+            18895.387,
+            18903.612,
+            18904.22,
+            18910.801,
+            18922.581,
+            18982.611,
+            20336.174
+          ],
+          "max_task_elapsed_ms": 20336.174,
+          "slowest_ms_invalid_legacy": null,
+          "consistency_note": "gather_wall_ms is true asyncio.gather elapsed; max(task_elapsed_ms) is the slowest individual task; Semaphore(6) is the concurrency limit; these are different quantities."
+        },
+        "history": {
+          "history_network_ms": 0.0,
+          "history_delay_sleep_ms": 0.0,
+          "history_processing_ms": 0.0,
+          "total_ms": 0.0
+        },
+        "history_aggregates": {
+          "network_ms": 0.0,
+          "delay_sleep_ms": 0.0,
+          "processing_ms": 0.0,
+          "total_ms": 0.0
+        },
+        "per_symbol": [
+          {
+            "symbol": "BTCUSD",
+            "total_ms": 1441.974,
+            "history_ms": null,
+            "analysis_ms": 1.853,
+            "timeframe_request_count": 4,
+            "retry_count": 0,
+            "history_network_ms": 0.0,
+            "history_delay_sleep_ms": 0.0,
+            "history_or_analysis_cpu_ms": 1.853
+          },
+          {
+            "symbol": "ETHUSD",
+            "total_ms": 1439.852,
+            "history_ms": null,
+            "analysis_ms": 0.794,
+            "timeframe_request_count": 4,
+            "retry_count": 0,
+            "history_network_ms": 0.0,
+            "history_delay_sleep_ms": 0.0,
+            "history_or_analysis_cpu_ms": 0.794
+          },
+          {
+            "symbol": "SOLUSD",
+            "total_ms": 0.002,
+            "history_ms": null,
+            "analysis_ms": 0.0,
+            "timeframe_request_count": 4,
+            "retry_count": 0
+          },
+          {
+            "symbol": "BNBUSD",
+            "total_ms": 1459.237,
+            "history_ms": null,
+            "analysis_ms": 0.867,
+            "timeframe_request_count": 4,
+            "retry_count": 0,
+            "history_network_ms": 0.0,
+            "history_delay_sleep_ms": 0.0,
+            "history_or_analysis_cpu_ms": 0.867
+          },
+          {
+            "symbol": "XRPUSD",
+            "total_ms": 0.001,
+            "history_ms": null,
+            "analysis_ms": 0.0,
+            "timeframe_request_count": 4,
+            "retry_count": 0
+          },
+          {
+            "symbol": "XMRUSD",
+            "total_ms": 0.001,
+            "history_ms": null,
+            "analysis_ms": 0.0,
+            "timeframe_request_count": 4,
+            "retry_count": 0
+          },
+          {
+            "symbol": "XLMUSD",
+            "total_ms": 0.0,
+            "history_ms": null,
+            "analysis_ms": 0.0,
+            "timeframe_request_count": 4,
+            "retry_count": 0
+          },
+          {
+            "symbol": "ZECUSD",
+            "total_ms": 0.0,
+            "history_ms": null,
+            "analysis_ms": 0.0,
+            "timeframe_request_count": 4,
+            "retry_count": 0
+          },
+          {
+            "symbol": "DASHUSD",
+            "total_ms": 1449.645,
+            "history_ms": null,
+            "analysis_ms": 1.073,
+            "timeframe_request_count": 4,
+            "retry_count": 0,
+            "history_network_ms": 0.0,
+            "history_delay_sleep_ms": 0.0,
+            "history_or_analysis_cpu_ms": 1.073
+          },
+          {
+            "symbol": "DOGEUSD",
+            "total_ms": 3051.408,
+            "history_ms": null,
+            "analysis_ms": 1.036,
+            "timeframe_request_count": 4,
+            "retry_count": 0,
+            "history_network_ms": 0.0,
+            "history_delay_sleep_ms": 0.0,
+            "history_or_analysis_cpu_ms": 1.036
+          }
+        ],
+        "duplicates": [],
+        "events": [],
+        "largest_atomic": {
+          "name": "other_discovery",
+          "ms": 20339.916
+        },
+        "second_largest_atomic": {
+          "name": "stage_2_market_discovery",
+          "ms": 20339.916
+        },
+        "residual_ms": 95798.597,
+        "nested_spans_are_not_in_top_level": true
+      },
+      "patch002dj_timings": {
+        "patch": "002D-J",
+        "clock": "time.perf_counter",
+        "created_to_ready_ms": 121890.908,
+        "top_level": [
+          {
+            "name": "job_creation",
+            "ms": 0.0,
+            "nested": false
+          },
+          {
+            "name": "accepted_queued",
+            "ms": 0.0,
+            "nested": false
+          },
+          {
+            "name": "export_function_start",
+            "ms": 0.0,
+            "nested": false
+          },
+          {
+            "name": "discovery",
+            "ms": 0.0,
+            "nested": false
+          },
+          {
+            "name": "quote_gather",
+            "ms": 0.0,
+            "nested": false
+          },
+          {
+            "name": "shortlist_selection",
+            "ms": 0.0,
+            "nested": false
+          },
+          {
+            "name": "deep_analysis",
+            "ms": 0.0,
+            "nested": false
+          },
+          {
+            "name": "per_symbol_history_timeframe_fetches",
+            "ms": 0.0,
+            "nested": false
+          },
+          {
+            "name": "enrichment",
+            "ms": 0.0,
+            "nested": false
+          },
+          {
+            "name": "truth_layer",
+            "ms": 0.0,
+            "nested": false
+          },
+          {
+            "name": "bootstrap_verification",
+            "ms": 0.0,
+            "nested": false
+          },
+          {
+            "name": "payload_assembly_serialization",
+            "ms": 0.0,
+            "nested": false
+          },
+          {
+            "name": "durable_result_write",
+            "ms": 0.0,
+            "nested": false
+          },
+          {
+            "name": "durable_ready_transition",
+            "ms": 0.0,
+            "nested": false
+          },
+          {
+            "name": "logical_complete_to_visible_ready",
+            "ms": 0.0,
+            "nested": false
+          }
+        ],
+        "nested": [],
+        "top_level_sum_ms": 0.0,
+        "residual_ms": 121890.908,
+        "residual_pct": 100.0,
+        "coverage_pct": 0.0,
+        "non_overlapping": true
+      }
+    }
+  ]
+}

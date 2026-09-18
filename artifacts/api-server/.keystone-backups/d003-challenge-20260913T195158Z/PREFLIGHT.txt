@@ -1,0 +1,4 @@
+Preflight: LIVE_OK
+pwd: /home/runner/workspace
+exports.py: present
+health: {"status":"ok","service":"AI Trading Bridge","mode":"read-only"}

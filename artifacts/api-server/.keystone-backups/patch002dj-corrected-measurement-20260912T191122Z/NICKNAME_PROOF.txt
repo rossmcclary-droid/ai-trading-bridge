@@ -1,0 +1,1 @@
+/api/scan/Challenge/export-ai/start

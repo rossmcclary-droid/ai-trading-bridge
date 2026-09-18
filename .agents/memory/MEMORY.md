@@ -1,0 +1,2 @@
+- [API artifact routing](api-artifact-routing.md) — shared proxy preserves the configured service prefix when forwarding API requests.
+- [Strategy bootstrap handling](strategy-bootstrap.md) — keep staged strategy metadata separate from unloaded rules and never invent missing strategy content.

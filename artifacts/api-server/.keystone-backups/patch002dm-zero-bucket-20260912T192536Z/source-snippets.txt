@@ -1,0 +1,30 @@
+# Exact snippets and paths
+
+# artifacts/api-server/app/services/export_timings.py:50-63
+def build_patch002dj(job, *, export_payload=None):
+    d=export_payload.get("diagnostics",{}) if isinstance(export_payload,dict) else {}
+    t=d.get("timing_ms",{}) if isinstance(d.get("timing_ms"),dict) else {}
+    c=job.get("_patch002dj_clock",{})
+    ...
+    total=e(c.get("created"),c.get("ready_visible")) or n(job.get("total_created_to_ready_ms"))
+    names=["job_creation","accepted_queued","export_function_start","discovery","quote_gather","shortlist_selection","deep_analysis","per_symbol_history_timeframe_fetches","enrichment","truth_layer","bootstrap_verification","payload_assembly_serialization","durable_result_write","durable_ready_transition","logical_complete_to_visible_ready"]
+    top=[{"name":n,"ms":0.0,"nested":False} for n in names]
+    return {"patch002dj_timings":{"patch":"002D-J",...}}
+
+# artifacts/api-server/app/routes/exports.py:735-749
+_timings_ms: dict[str,float] = {}
+def _finish_stage(name):
+    _timings_ms[name]=round((time.perf_counter()-_timing_stage_started)*1000,3)
+
+# exports.py:3907-3915
+export_payload["diagnostics"]={
+  "patch002dj_timings_ms": dict(_timings_ms), ...}
+
+# exports.py:4004, 4028-4031
+_job_payload=json.loads(response.body.decode("utf-8"))
+_patch002dj_clock["logical_complete"]=_state_finalization_started
+_patch002dj_clock["ready_visible"]=_state_finalization_started
+_job_payload.setdefault("diagnostics",{})["patch002dj_timings"]=build_patch002dj(job, export_payload=_job_payload)["patch002dj_timings"]
+
+# exports.py:4047-4048
+job["total_created_to_ready_ms"]=round((time.perf_counter()-created_perf)*1000,3)

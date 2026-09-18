@@ -1,0 +1,49 @@
+"""Match-Trader connector placeholder."""
+
+from typing import Any
+
+from app.connectors.base import ReadOnlyConnector
+
+
+class MatchTraderConnector(ReadOnlyConnector):
+    """Future Match-Trader read-only integration."""
+
+    provider = "match-trader"
+
+    async def authenticate(self) -> dict[str, Any]:
+        raise NotImplementedError("Match-Trader connector is not configured")
+
+    async def get_accounts(self) -> list[dict[str, Any]]:
+        raise NotImplementedError("Match-Trader connector is not configured")
+
+    async def get_available_instruments(
+        self, account_id: int, acc_num: str
+    ) -> dict[str, Any]:
+        raise NotImplementedError("Match-Trader connector is not configured")
+
+    async def get_account_state(
+        self, account_id: int, acc_num: str
+    ) -> dict[str, Any]:
+        raise NotImplementedError("Match-Trader connector is not configured")
+
+    async def get_open_positions(
+        self, account_id: int, acc_num: str
+    ) -> dict[str, Any]:
+        raise NotImplementedError("Match-Trader connector is not configured")
+
+    async def get_pending_orders(
+        self, account_id: int, acc_num: str
+    ) -> dict[str, Any]:
+        raise NotImplementedError("Match-Trader connector is not configured")
+
+    async def get_historical_candles(
+        self,
+        account_id: int,
+        acc_num: str,
+        tradable_instrument_id: int,
+        route_id: int,
+        resolution: str,
+        from_timestamp: int,
+        to_timestamp: int,
+    ) -> dict[str, Any]:
+        raise NotImplementedError("Match-Trader connector is not configured")

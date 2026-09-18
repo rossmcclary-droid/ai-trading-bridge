@@ -1,0 +1,318 @@
+"""Read-only TradeLocker Public API connector.
+
+The Public API's documented JWT flow requires email, password, and broker
+server. Values are loaded from environment variables and are never returned
+by this module or an HTTP endpoint.
+"""
+
+import asyncio
+import json
+import os
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+from app.connectors.base import ReadOnlyConnector
+
+
+class CandleResolution(StrEnum):
+    """Candle resolutions exposed by AI Trading Bridge."""
+
+    FOUR_HOURS = "4H"
+    ONE_HOUR = "1H"
+    FIFTEEN_MINUTES = "15M"
+    FIVE_MINUTES = "5M"
+
+
+_TRADELOCKER_RESOLUTIONS = {
+    CandleResolution.FOUR_HOURS: "4H",
+    CandleResolution.ONE_HOUR: "1H",
+    CandleResolution.FIFTEEN_MINUTES: "15m",
+    CandleResolution.FIVE_MINUTES: "5m",
+}
+
+
+class TradeLockerConfigurationError(RuntimeError):
+    """Raised when the documented auth configuration is incomplete."""
+
+
+class TradeLockerAPIError(RuntimeError):
+    """Raised when the Public API cannot complete a read request."""
+
+
+@dataclass(frozen=True)
+class TradeLockerConfig:
+    """TradeLocker Demo environment configuration."""
+
+    base_url: str
+    email: str
+    password: str
+    server: str
+    developer_api_key: str | None = None
+
+    @classmethod
+    def from_environment(cls) -> "TradeLockerConfig":
+        return cls(
+            base_url=os.getenv(
+                "TRADELOCKER_DEMO_BASE_URL",
+                "https://demo.tradelocker.com/backend-api",
+            ).rstrip("/"),
+            email=os.getenv("TRADELOCKER_DEMO_EMAIL", ""),
+            password=os.getenv("TRADELOCKER_DEMO_PASSWORD", ""),
+            server=os.getenv("TRADELOCKER_DEMO_SERVER", ""),
+            developer_api_key=os.getenv("TRADELOCKER_DEVELOPER_API_KEY") or None,
+        )
+
+    def missing_required_values(self) -> list[str]:
+        """Return names only, never configuration values."""
+
+        missing = []
+        if not self.base_url:
+            missing.append("TRADELOCKER_DEMO_BASE_URL")
+        if not self.email:
+            missing.append("TRADELOCKER_DEMO_EMAIL")
+        if not self.password:
+            missing.append("TRADELOCKER_DEMO_PASSWORD")
+        if not self.server:
+            missing.append("TRADELOCKER_DEMO_SERVER")
+        return missing
+
+
+class TradeLockerConnector(ReadOnlyConnector):
+    """TradeLocker Public API client with no trade-write operations."""
+
+    provider = "tradelocker"
+
+    def __init__(self, config: TradeLockerConfig | None = None) -> None:
+        self.config = config or TradeLockerConfig.from_environment()
+        self._access_token: str | None = None
+
+    def configuration_status(self) -> dict[str, Any]:
+        """Return safe configuration metadata for an account status endpoint."""
+
+        missing = self.config.missing_required_values()
+        return {
+            "configured": not missing,
+            "missing_configuration": missing,
+            "authentication_method": "TradeLocker Public API JWT (email, password, server)",
+            "google_sign_in_supported": False,
+            "message": (
+                "The documented Public API JWT method requires email, password, "
+                "and broker server. A Google-sign-in TradeLocker Profile cannot "
+                "authenticate through that documented method unless a supported "
+                "password-based API credential is available."
+            ),
+        }
+
+    async def authenticate(self) -> dict[str, Any]:
+        """Fetch JWT tokens using the official documented auth endpoint."""
+
+        missing = self.config.missing_required_values()
+        if missing:
+            raise TradeLockerConfigurationError(
+                "TradeLocker Public API configuration is incomplete: "
+                + ", ".join(missing)
+            )
+        response = await self._request(
+            "POST",
+            "/auth/jwt/token",
+            body={
+                "email": self.config.email,
+                "password": self.config.password,
+                "server": self.config.server,
+            },
+            authenticated=False,
+        )
+        access_token = response.get("accessToken")
+        if not isinstance(access_token, str) or not access_token:
+            raise TradeLockerAPIError("TradeLocker auth response had no accessToken")
+        self._access_token = access_token
+        return {
+            "authenticated": True,
+            "expire_date": response.get("expireDate"),
+        }
+
+    async def get_accounts(self) -> list[dict[str, Any]]:
+        response = await self._request("GET", "/auth/jwt/all-accounts")
+        return _data_list(response)
+
+    async def get_available_instruments(
+        self, account_id: int, acc_num: str
+    ) -> dict[str, Any]:
+        return await self._trade_get(
+            f"/trade/accounts/{account_id}/instruments",
+            {"accNum": acc_num},
+        )
+
+    async def get_trade_config(
+        self,
+        *,
+        acc_num: str,
+    ) -> dict[str, Any]:
+        """Return TradeLocker field/config metadata."""
+
+        return await self._trade_get(
+            "/trade/config",
+            {
+                "accNum": acc_num,
+            },
+        )
+
+    async def get_quotes(
+        self,
+        *,
+        tradable_instrument_id: int,
+        route_id: int,
+        acc_num: str,
+    ) -> dict[str, Any]:
+        """Return the current TradeLocker quote for one instrument."""
+
+        return await self._trade_get(
+            "/trade/quotes",
+            {
+                "accNum": acc_num,
+                "routeId": route_id,
+                "tradableInstrumentId": tradable_instrument_id,
+            },
+        )
+
+    async def get_instrument_details(
+        self,
+        *,
+        tradable_instrument_id: int,
+        route_id: int,
+        acc_num: str,
+    ) -> dict[str, Any]:
+        """Return detailed sizing/trading settings for one instrument."""
+
+        return await self._trade_get(
+            f"/trade/instruments/{tradable_instrument_id}",
+            {
+                "accNum": acc_num,
+                "routeId": route_id,
+            },
+        )
+
+    async def get_account_state(
+        self, account_id: int, acc_num: str
+    ) -> dict[str, Any]:
+        return await self._trade_get(
+            f"/trade/accounts/{account_id}/state",
+            {"accNum": acc_num},
+        )
+
+    async def get_open_positions(
+        self, account_id: int, acc_num: str
+    ) -> dict[str, Any]:
+        return await self._trade_get(
+            f"/trade/accounts/{account_id}/positions",
+            {"accNum": acc_num},
+        )
+
+    async def get_pending_orders(
+        self, account_id: int, acc_num: str
+    ) -> dict[str, Any]:
+        return await self._trade_get(
+            f"/trade/accounts/{account_id}/orders",
+            {"accNum": acc_num},
+        )
+
+    async def get_historical_candles(
+        self,
+        account_id: int,
+        acc_num: str,
+        tradable_instrument_id: int,
+        route_id: int,
+        resolution: str,
+        from_timestamp: int,
+        to_timestamp: int,
+    ) -> dict[str, Any]:
+        try:
+            normalized_resolution = CandleResolution(resolution.upper())
+        except ValueError as error:
+            allowed = ", ".join(item.value for item in CandleResolution)
+            raise ValueError(f"resolution must be one of: {allowed}") from error
+        return await self._trade_get(
+            "/trade/history",
+            {
+                "accountId": account_id,
+                "accNum": acc_num,
+                "tradableInstrumentId": tradable_instrument_id,
+                "routeId": route_id,
+                "resolution": _TRADELOCKER_RESOLUTIONS[normalized_resolution],
+                "from": from_timestamp,
+                "to": to_timestamp,
+            },
+        )
+
+    async def _trade_get(
+        self, path: str, query: dict[str, Any]
+    ) -> dict[str, Any]:
+        return await self._request("GET", path, query=query)
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: dict[str, Any] | None = None,
+        body: dict[str, Any] | None = None,
+        authenticated: bool = True,
+    ) -> dict[str, Any]:
+        url = f"{self.config.base_url}{path}"
+        query_params = dict(query or {})
+        acc_num = query_params.pop("accNum", None)
+
+        if query_params:
+            url = f"{url}?{urlencode(query_params)}"
+        headers = {
+            "accept": "application/json",
+            "User-Agent": "AI-Trading-Bridge/1.0",
+        }
+        if acc_num is not None:
+            headers["accNum"] = str(acc_num)
+
+        if body is not None:
+            headers["content-type"] = "application/json"
+        if authenticated:
+            if not self._access_token:
+                await self.authenticate()
+            headers["authorization"] = f"Bearer {self._access_token}"
+        if self.config.developer_api_key:
+            headers["tl-developer-api-key"] = self.config.developer_api_key
+        request = Request(
+            url,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers=headers,
+            method=method,
+        )
+        try:
+            return await asyncio.to_thread(self._open_json, request)
+        except (HTTPError, URLError, TimeoutError) as error:
+            raise TradeLockerAPIError(
+                f"TradeLocker {method} {path} request failed"
+            ) from error
+
+    @staticmethod
+    def _open_json(request: Request) -> dict[str, Any]:
+        with urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode())
+        if not isinstance(payload, dict):
+            raise TradeLockerAPIError("TradeLocker response was not a JSON object")
+        return payload
+
+
+def _data_list(response: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize the documented account-list envelope without losing fields."""
+
+    data = response.get("d", response)
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if isinstance(data, dict):
+        accounts = data.get("accounts", data.get("data", []))
+        if isinstance(accounts, list):
+            return [item for item in accounts if isinstance(item, dict)]
+    return []

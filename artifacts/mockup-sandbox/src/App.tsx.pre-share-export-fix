@@ -1,0 +1,2576 @@
+import { useEffect, useState } from "react";
+
+type Order = {
+  order_type: string;
+  instrument: string;
+  entry: number;
+  safe_loss: number;
+  take_profit_1: number;
+  take_profit_2: number;
+  take_profit_3: number;
+  grade: string;
+  reason: string;
+};
+
+type Alert = {
+  instrument: string;
+  alert_level: number;
+  meaning: string;
+  alert_type: string;
+  grade: string;
+  state: string;
+  bias: string;
+};
+
+type WatchItem = {
+  instrument: string;
+  grade: string;
+  decision: string;
+  state: string;
+  bias: string;
+  reason: string;
+};
+
+type TopCandidate = {
+  instrument: string;
+  score: number;
+  grade: string;
+  decision: string;
+  state: string;
+  bias: string;
+  current_price: number | null;
+  entry_quality: string;
+  invalidation: number | null;
+  target_reference: number | null;
+  reward_to_risk: number | null;
+  extension: string;
+  "5m_confirmed": boolean;
+  next_conditions: string[];
+  satisfied_conditions: string[];
+  reason: string;
+  rr_tp1?: number | null;
+  rr_tp2?: number | null;
+  rr_tp3?: number | null;
+};
+
+type PendingSetup = {
+  instrument: string;
+  direction: string;
+  status: string;
+  entry_reference: number;
+  safe_loss: number;
+  tp1: number;
+  tp2: number;
+  tp3: number;
+  rr_tp1: number | null;
+  rr_tp2: number | null;
+  rr_tp3: number | null;
+  requirements_remaining: string[];
+  requirements_satisfied: string[];
+};
+
+type TradingSummary = {
+  account: string;
+  requested: number;
+  successful: number;
+  failed: number;
+  errors: Record<string, string>;
+  top_candidate: TopCandidate | null;
+  pending_setup: PendingSetup | null;
+  executable_orders: Order[];
+  alerts: Alert[];
+  watchlist: WatchItem[];
+};
+
+function Card({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section
+      style={{
+        background: "#151515",
+        border: "1px solid #303030",
+        borderRadius: 18,
+        padding: 18,
+      }}
+    >
+      <div
+        style={{
+          fontSize: 13,
+          letterSpacing: 1,
+          color: "#8f8f8f",
+          marginBottom: 14,
+        }}
+      >
+        {title}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function BiasBadge({ bias }: { bias: string }) {
+  const bullish = bias === "bullish";
+  const bearish = bias === "bearish";
+
+  return (
+    <span
+      style={{
+        borderRadius: 999,
+        padding: "5px 9px",
+        fontSize: 12,
+        background: bullish
+          ? "#14351f"
+          : bearish
+          ? "#3a1717"
+          : "#292929",
+        color: bullish
+          ? "#8fe0a5"
+          : bearish
+          ? "#ffaaaa"
+          : "#bbb",
+      }}
+    >
+      {bias.toUpperCase()}
+    </span>
+  );
+}
+
+export default function App() {
+  const [data, setData] = useState<TradingSummary | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [exportingAiScan, setExportingAiScan] = useState(false);
+  const [notificationPermission, setNotificationPermission] =
+    useState<NotificationPermission>(
+      typeof Notification === "undefined"
+        ? "denied"
+        : Notification.permission,
+    );
+
+  const [error, setError] = useState("");
+  const [lastScan, setLastScan] = useState("");
+  const [monitorInterval, setMonitorInterval] =
+    useState<10 | 30 | 60>(60);
+  const [testState] = useState<"LIVE" | "PENDING" | "EXECUTABLE">("LIVE");
+  const [approvalMessage, setApprovalMessage] = useState("");
+
+  const [monitorStatus, setMonitorStatus] = useState<{
+    running: boolean;
+    nickname: string | null;
+    interval_seconds: number;
+    started_at: string | null;
+    last_scan_at: string | null;
+    scan_count: number;
+    last_error: string | null;
+    actionable_trade_found: boolean;
+    actionable_instrument: string | null;
+    stop_reason: string | null;
+    frozen_trade_plan: {
+      instrument?: string | null;
+      order_type?: string | null;
+      entry?: number | null;
+      safe_loss?: number | null;
+      take_profit_1?: number | null;
+      take_profit_2?: number | null;
+      take_profit_3?: number | null;
+      grade?: string | null;
+      reason?: string | null;
+      captured_at?: string | null;
+      source?: string | null;
+    } | null;
+  } | null>(null);
+
+  const [bootstrapStatus, setBootstrapStatus] = useState<{
+    sha256: string;
+    size_bytes: number;
+    modified_at: string;
+    previous_available: boolean;
+    previous_filename: string | null;
+    restart_required: boolean;
+  } | null>(null);
+
+  const [bootstrapBusy, setBootstrapBusy] = useState(false);
+  const [bootstrapMessage, setBootstrapMessage] = useState("");
+  const [pendingBootstrap, setPendingBootstrap] = useState<{
+    file: File;
+    content: string;
+    fingerprint: string;
+  } | null>(null);
+
+
+
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function refreshMonitorStatus() {
+      try {
+        const response = await fetch("/api/monitor/status");
+
+        if (!response.ok) {
+          throw new Error(`Monitor status failed: HTTP ${response.status}`);
+        }
+
+        const status = await response.json();
+
+        if (!cancelled) {
+          setMonitorStatus(status);
+
+          if (status.latest_result) {
+            setData(status.latest_result);
+            setLastScan(
+              status.last_scan_at
+                ? new Date(status.last_scan_at).toLocaleTimeString()
+                : new Date().toLocaleTimeString()
+            );
+          }
+        }
+      } catch {
+        // Keep the last known status if the monitor endpoint
+        // is briefly unavailable.
+      }
+    }
+
+    void refreshMonitorStatus();
+
+    const timer = window.setInterval(() => {
+      void refreshMonitorStatus();
+    }, 5000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  async function submitApprovalAction(
+    action: string,
+    instrument: string,
+    account: string | null = "Challenge",
+    trade?: {
+      direction: "LONG" | "SHORT";
+      entry: number;
+      safe_loss: number;
+      take_profit_1: number;
+      take_profit_2: number;
+    },
+  ) {
+    setApprovalMessage("Sending approval decision...");
+
+    try {
+      const response = await fetch("/api/approvals", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          action,
+          instrument,
+          account,
+          ...(trade ?? {}),
+        }),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(result?.detail ?? `HTTP ${response.status}`);
+      }
+
+      const parts = [
+        result.message ?? "Decision recorded.",
+        `Action: ${result.action}`,
+        `Execution: ${result.execution_status}`,
+      ];
+
+      if (result.explanation_requested) {
+        parts.push("Explanation requested.");
+      }
+
+      if (result.all_accounts) {
+        parts.push("Scope: all connected accounts.");
+      }
+
+      if (result.execution_preview) {
+        const p = result.execution_preview;
+
+        parts.push(
+          `DRY RUN: ${p.side} ${p.instrument} | Entry ${p.entry} | Safe Loss ${p.safe_loss} | TP1 ${p.take_profit_1} | TP2 ${p.take_profit_2}.`,
+        );
+      }
+
+      if (result.validation_error) {
+        parts.push(`BLOCKED: ${result.validation_error}`);
+      }
+
+      setApprovalMessage(parts.join(" "));
+    } catch (error) {
+      setApprovalMessage(
+        `Approval request failed: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+      );
+    }
+  }
+
+
+
+  async function exportAiScan() {
+    setExportingAiScan(true);
+    setError("");
+
+    try {
+      const response = await fetch(
+        "/api/scan/Challenge/export-ai",
+      );
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const blob = await response.blob();
+
+      const disposition =
+        response.headers.get("Content-Disposition") ?? "";
+
+      const filenameMatch =
+        disposition.match(/filename="?([^"]+)"?/i);
+
+      const filename =
+        filenameMatch?.[1] ??
+        `AI_Scan_Challenge_${new Date()
+          .toISOString()
+          .replace(/[:.]/g, "-")}.json`;
+
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+
+      link.href = url;
+      link.download = filename;
+
+      document.body.appendChild(link);
+      link.click();
+
+      // Mobile browsers may begin blob downloads asynchronously.
+      // Keep the object URL alive long enough for Android/Chrome
+      // to hand the file off to the download manager.
+      window.setTimeout(() => {
+        link.remove();
+        URL.revokeObjectURL(url);
+      }, 30000);
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? `AI Scan export failed: ${err.message}`
+          : "AI Scan export failed.",
+      );
+    } finally {
+      setExportingAiScan(false);
+    }
+  }
+
+
+
+
+  async function showBridgeNotification(
+    title: string,
+    body: string,
+  ) {
+    if (!("serviceWorker" in navigator)) {
+      setError(
+        "Service-worker notifications are not supported in this browser.",
+      );
+      return;
+    }
+
+    if (
+      !("Notification" in window) ||
+      Notification.permission !== "granted"
+    ) {
+      return;
+    }
+
+    const registration =
+      await navigator.serviceWorker.register("/sw.js");
+
+    await navigator.serviceWorker.ready;
+
+    await registration.showNotification(title, {
+      body,
+      tag: "ai-trading-bridge-trade-alert",
+      data: {
+        url: "/",
+      },
+    });
+  }
+
+
+  async function enableNotifications() {
+    if (!("Notification" in window)) {
+      setError("Notifications are not supported in this browser.");
+      return;
+    }
+
+    const permission = await Notification.requestPermission();
+    setNotificationPermission(permission);
+
+    if (permission === "granted") {
+      setNotificationPermission("granted");
+    }
+  }
+
+
+
+
+  async function refreshBootstrapStatus() {
+    try {
+      const response = await fetch("/api/bootstrap/status");
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const result = await response.json();
+      setBootstrapStatus(result);
+    } catch (err) {
+      setBootstrapMessage(
+        err instanceof Error
+          ? `Bootstrap status failed: ${err.message}`
+          : "Unable to read Bootstrap status.",
+      );
+    }
+  }
+
+  async function reviewBootstrapFile(file: File) {
+    setBootstrapBusy(true);
+    setBootstrapMessage("");
+
+    try {
+      const content = await file.text();
+
+      if (!content.trim()) {
+        throw new Error("Bootstrap file is empty.");
+      }
+
+      const requiredSections = [
+        "PART I — HUMAN-READABLE STRATEGY",
+        "PART II — MACHINE-READABLE BOOTSTRAP",
+      ];
+
+      for (const section of requiredSections) {
+        if (!content.includes(section)) {
+          throw new Error(
+            `Revision is missing required section: ${section}`,
+          );
+        }
+      }
+
+      const bytes = new TextEncoder().encode(content);
+      const digest = await crypto.subtle.digest("SHA-256", bytes);
+
+      const fingerprint = Array.from(
+        new Uint8Array(digest),
+      )
+        .map((byte) => byte.toString(16).padStart(2, "0"))
+        .join("");
+
+      setPendingBootstrap({
+        file,
+        content,
+        fingerprint,
+      });
+
+      setBootstrapMessage("");
+    } catch (err) {
+      setPendingBootstrap(null);
+
+      setBootstrapMessage(
+        err instanceof Error
+          ? `Bootstrap review blocked: ${err.message}`
+          : "Unable to review Bootstrap revision.",
+      );
+    } finally {
+      setBootstrapBusy(false);
+    }
+  }
+
+  async function confirmBootstrapInstall() {
+    if (!pendingBootstrap) return;
+
+    setBootstrapBusy(true);
+    setBootstrapMessage("");
+
+    try {
+      const response = await fetch("/api/bootstrap/install", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          content: pendingBootstrap.content,
+          source_name: pendingBootstrap.file.name,
+        }),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          result?.detail ?? `HTTP ${response.status}`,
+        );
+      }
+
+      setBootstrapStatus(result);
+      setPendingBootstrap(null);
+
+      setBootstrapMessage(
+        "Revision installed safely. Restart backend to activate it.",
+      );
+    } catch (err) {
+      setBootstrapMessage(
+        err instanceof Error
+          ? `Bootstrap update blocked: ${err.message}`
+          : "Bootstrap update failed.",
+      );
+    } finally {
+      setBootstrapBusy(false);
+    }
+  }
+
+
+  async function rollbackBootstrap() {
+    if (!bootstrapStatus?.previous_available) {
+      setBootstrapMessage(
+        "No previous Bootstrap revision is available.",
+      );
+      return;
+    }
+
+    setBootstrapBusy(true);
+    setBootstrapMessage("");
+
+    try {
+      const response = await fetch(
+        "/api/bootstrap/rollback",
+        {
+          method: "POST",
+        },
+      );
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          result?.detail ?? `HTTP ${response.status}`,
+        );
+      }
+
+      setBootstrapStatus(result);
+      setBootstrapMessage(
+        "Previous Bootstrap restored. Restart backend to activate it.",
+      );
+    } catch (err) {
+      setBootstrapMessage(
+        err instanceof Error
+          ? `Rollback failed: ${err.message}`
+          : "Bootstrap rollback failed.",
+      );
+    } finally {
+      setBootstrapBusy(false);
+    }
+  }
+
+
+
+  useEffect(() => {
+    void refreshBootstrapStatus();
+  }, []);
+
+  useEffect(() => {
+    if (
+      notificationPermission === "granted" &&
+      "serviceWorker" in navigator
+    ) {
+      void navigator.serviceWorker.register("/sw.js");
+    }
+  }, [notificationPermission]);
+async function scanChallenge() {
+    setLoading(true);
+    setError("");
+
+    try {
+      const response = await fetch(
+        "/api/scan/Challenge/trading-summary"
+      );
+
+      if (!response.ok) {
+        throw new Error(`Scan failed: HTTP ${response.status}`);
+      }
+
+      const result: TradingSummary = await response.json();
+
+      setData(result);
+      setLastScan(new Date().toLocaleTimeString());
+
+      const actionableTradeFound =
+        result.executable_orders.length > 0 ||
+        result.pending_setup?.status === "READY FOR REASSESSMENT";
+
+      if (actionableTradeFound) {
+
+        if ("Notification" in window) {
+          if (Notification.permission === "granted") {
+            const instrument =
+              result.executable_orders[0]?.instrument ??
+              result.pending_setup?.instrument ??
+              "Trade";
+
+            void showBridgeNotification(
+              "Atlas AI Bridge",
+              `${instrument} setup is ready for approval.`,
+            );
+          } else if (Notification.permission === "default") {
+            void Notification.requestPermission().then((permission) => {
+              if (permission === "granted") {
+                const instrument =
+                  result.executable_orders[0]?.instrument ??
+                  result.pending_setup?.instrument ??
+                  "Trade";
+
+                void showBridgeNotification(
+                  "Atlas AI Bridge",
+                  `${instrument} setup is ready for approval.`,
+                );
+              }
+            });
+          }
+        }
+      }
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Unable to run scan."
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <main
+      style={{
+        minHeight: "100vh",
+        background: "#090909",
+        color: "#f5f5f5",
+        fontFamily: "system-ui, sans-serif",
+        padding: "22px 16px 48px",
+      }}
+    >
+      <div
+        style={{
+          maxWidth: 760,
+          margin: "0 auto",
+          display: "grid",
+          gap: 16,
+        }}
+      >
+        <header>
+          <div
+            style={{
+              fontSize: 13,
+              color: "#8d8d8d",
+              letterSpacing: 0.8,
+            }}
+          >
+            LIVE MARKET SCANNER
+          </div>
+
+          <h1
+            style={{
+              margin: "5px 0 0",
+              fontSize: 30,
+            }}
+          >
+            Atlas AI Bridge
+          </h1>
+        </header>
+
+        <Card title="ACCOUNT">
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: 16,
+            }}
+          >
+            <div>
+              <div style={{ fontSize: 22, fontWeight: 700 }}>
+                Challenge
+              </div>
+              <div
+                style={{
+                  color: "#8d8d8d",
+                  marginTop: 4,
+                }}
+              >
+                TradeLocker · Read-only
+              </div>
+            </div>
+
+            <div
+              style={{
+                padding: "7px 11px",
+                borderRadius: 999,
+                background: "#14351f",
+                color: "#8fe0a5",
+                fontSize: 13,
+              }}
+            >
+              Connected
+            </div>
+          </div>
+        </Card>
+
+        <button
+          onClick={scanChallenge}
+          disabled={loading}
+          style={{
+            border: 0,
+            borderRadius: 15,
+            padding: "17px 18px",
+            fontSize: 17,
+            fontWeight: 750,
+            background: loading ? "#343434" : "#f2f2f2",
+            color: loading ? "#aaa" : "#111",
+          }}
+        >
+          {loading ? "Scanning markets..." : "Scan Challenge"}
+        </button>
+
+        <button
+      type="button"
+      onClick={() => void exportAiScan()}
+      disabled={loading || exportingAiScan}
+      style={{
+        border: "1px solid #31516f",
+        borderRadius: 15,
+        padding: "15px 18px",
+        fontSize: 16,
+        fontWeight: 750,
+        background:
+          loading || exportingAiScan
+            ? "#17202a"
+            : "#102b43",
+        color:
+          loading || exportingAiScan
+            ? "#778899"
+            : "#a9d6ff",
+      }}
+    >
+      {exportingAiScan
+        ? "Building AI Scan..."
+        : "Export AI Scan"}
+    </button>
+
+    <button
+      type="button"
+      onClick={() => void enableNotifications()}
+      disabled={notificationPermission === "granted"}
+      style={{
+        border: "1px solid #3a493e",
+        borderRadius: 12,
+        padding: "12px 14px",
+        background:
+          notificationPermission === "granted"
+            ? "#102517"
+            : "#151515",
+        color:
+          notificationPermission === "granted"
+            ? "#8fe0a5"
+            : "#c7c7c7",
+        fontSize: 14,
+        fontWeight: 700,
+      }}
+    >
+      {notificationPermission === "granted"
+        ? "Notifications: ON"
+        : "Enable Notifications"}
+    </button>
+      <div
+        style={{
+          border: "1px solid #303030",
+          borderRadius: 12,
+          padding: 14,
+          display: "grid",
+          gap: 10,
+          background: "#101010",
+        }}
+      >
+        <div
+          style={{
+            fontSize: 13,
+            color: "#a7a7a7",
+            fontWeight: 700,
+          }}
+        >
+          Monitor scan interval
+        </div>
+
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(3, 1fr)",
+            gap: 8,
+          }}
+        >
+          {([10, 30, 60] as const).map((seconds) => {
+            const selected = monitorInterval === seconds;
+
+            return (
+              <button
+                key={seconds}
+                type="button"
+                disabled={Boolean(monitorStatus?.running)}
+                onClick={() => setMonitorInterval(seconds)}
+                style={{
+                  border: selected
+                    ? "1px solid #47765a"
+                    : "1px solid #303030",
+                  borderRadius: 10,
+                  padding: "11px 8px",
+                  background: selected ? "#17311f" : "#181818",
+                  color: selected ? "#8fe0a5" : "#b0b0b0",
+                  fontSize: 14,
+                  fontWeight: 800,
+                  opacity: monitorStatus?.running ? 0.65 : 1,
+                }}
+              >
+                {seconds}s
+              </button>
+            );
+          })}
+        </div>
+
+        {monitorStatus?.running && (
+          <div style={{ fontSize: 12, color: "#777" }}>
+            Stop the monitor to change its interval.
+          </div>
+        )}
+      </div>
+
+
+      <Card title="LIVE MONITOR">
+        <div
+          style={{
+            display: "grid",
+            gap: 12,
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: 12,
+            }}
+          >
+            <div
+              style={{
+                fontSize: 20,
+                fontWeight: 800,
+              }}
+            >
+              {monitorStatus?.actionable_trade_found
+                ? "TRADE FOUND"
+                : monitorStatus?.running
+                  ? "MONITORING"
+                  : "STOPPED"}
+            </div>
+
+            <div
+              style={{
+                borderRadius: 999,
+                padding: "6px 10px",
+                background: monitorStatus?.actionable_trade_found
+                  ? "#3b2b0d"
+                  : monitorStatus?.running
+                    ? "#102517"
+                    : "#202020",
+                color: monitorStatus?.actionable_trade_found
+                  ? "#f1c27d"
+                  : monitorStatus?.running
+                    ? "#8fe0a5"
+                    : "#9d9d9d",
+                fontSize: 12,
+                fontWeight: 800,
+              }}
+            >
+              {monitorStatus?.actionable_trade_found
+                ? "ACTION REQUIRED"
+                : monitorStatus?.running
+                  ? "RUNNING"
+                  : "OFF"}
+            </div>
+          </div>
+
+          <div
+            style={{
+              color: "#a7a7a7",
+              lineHeight: 1.55,
+              fontSize: 14,
+            }}
+          >
+            <div>
+              Account:{" "}
+              <strong style={{ color: "#e5e5e5" }}>
+                {monitorStatus?.nickname ?? "Challenge"}
+              </strong>
+            </div>
+
+            <div>
+              Scan interval:{" "}
+              <strong style={{ color: "#e5e5e5" }}>
+                {monitorStatus?.interval_seconds ?? 60}s
+              </strong>
+            </div>
+
+            <div>
+              Scans completed:{" "}
+              <strong style={{ color: "#e5e5e5" }}>
+                {monitorStatus?.scan_count ?? 0}
+              </strong>
+            </div>
+
+            <div>
+              Last scan:{" "}
+              <strong style={{ color: "#e5e5e5" }}>
+                {monitorStatus?.last_scan_at
+                  ? new Date(monitorStatus.last_scan_at).toLocaleTimeString()
+                  : "Waiting..."}
+              </strong>
+            </div>
+          </div>
+
+          {monitorStatus?.last_error && (
+            <div
+              style={{
+                border: "1px solid #5a2d2d",
+                borderRadius: 10,
+                padding: 10,
+                color: "#f0a0a0",
+                fontSize: 13,
+              }}
+            >
+              Monitor error: {monitorStatus.last_error}
+            </div>
+          )}
+
+          {!monitorStatus?.actionable_trade_found &&
+            monitorStatus?.running && (
+              <div
+                style={{
+                  border: "1px solid #303030",
+                  borderRadius: 10,
+                  padding: 12,
+                  color: "#bcbcbc",
+                  fontSize: 14,
+                }}
+              >
+                Waiting for a clean actionable setup...
+              </div>
+            )}
+
+          {monitorStatus?.frozen_trade_plan && (
+            <div
+              style={{
+                border: "1px solid #4b3d24",
+                borderRadius: 12,
+                padding: 14,
+                display: "grid",
+                gap: 8,
+              }}
+            >
+              <div
+                style={{
+                  fontSize: 16,
+                  fontWeight: 800,
+                }}
+              >
+                {monitorStatus.frozen_trade_plan.instrument ?? "Trade"}
+              </div>
+
+              <div style={{ color: "#c7c7c7", lineHeight: 1.6 }}>
+                <div>
+                  Order type:{" "}
+                  {monitorStatus.frozen_trade_plan.order_type ?? "—"}
+                </div>
+                <div>
+                  Entry:{" "}
+                  {monitorStatus.frozen_trade_plan.entry ?? "—"}
+                </div>
+                <div>
+                  Safe Loss:{" "}
+                  {monitorStatus.frozen_trade_plan.safe_loss ?? "—"}
+                </div>
+                <div>
+                  Take Profit 1:{" "}
+                  {monitorStatus.frozen_trade_plan.take_profit_1 ?? "—"}
+                </div>
+                <div>
+                  Take Profit 2:{" "}
+                  {monitorStatus.frozen_trade_plan.take_profit_2 ?? "—"}
+                </div>
+                <div>
+                  Grade:{" "}
+                  {monitorStatus.frozen_trade_plan.grade ?? "—"}
+                </div>
+              </div>
+
+              {monitorStatus.frozen_trade_plan.reason && (
+                <div
+                  style={{
+                    color: "#a7a7a7",
+                    fontSize: 13,
+                    lineHeight: 1.5,
+                  }}
+                >
+                  {monitorStatus.frozen_trade_plan.reason}
+                </div>
+              )}
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={async () => {
+              try {
+                const running = Boolean(monitorStatus?.running);
+
+                const response = await fetch(
+                  running
+                    ? "/api/monitor/stop"
+                    : "/api/monitor/start",
+                  {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                    },
+                    body: running
+                      ? undefined
+                      : JSON.stringify({
+                          nickname: "Challenge",
+                          interval_seconds: monitorInterval,
+                        }),
+                  },
+                );
+
+                if (!response.ok) {
+                  throw new Error(
+                    `Monitor request failed: HTTP ${response.status}`,
+                  );
+                }
+
+                const status = await response.json();
+                setMonitorStatus(status);
+              } catch (error) {
+                console.error(error);
+              }
+            }}
+            style={{
+              width: "100%",
+              border: monitorStatus?.running
+                ? "1px solid #573535"
+                : "1px solid #31543c",
+              borderRadius: 12,
+              padding: "14px 16px",
+              background: monitorStatus?.running
+                ? "#321a1a"
+                : "#17311f",
+              color: monitorStatus?.running
+                ? "#e8a0a0"
+                : "#8fe0a5",
+              fontSize: 15,
+              fontWeight: 800,
+            }}
+          >
+            {monitorStatus?.running
+              ? "Stop Monitor"
+              : "Start Monitor"}
+          </button>
+        </div>
+      </Card>
+
+      <Card title="BOOTSTRAP">
+        <details>
+          <summary
+            style={{
+              cursor: "pointer",
+              border: "1px solid #303030",
+              borderRadius: 12,
+              padding: "14px 16px",
+              background: "#141414",
+              color: "#c7c7c7",
+              fontSize: 14,
+              fontWeight: 800,
+              listStyle: "none",
+            }}
+          >
+            Open Bootstrap Tools
+          </summary>
+
+          <div style={{ marginTop: 12 }}>
+
+      <div
+        style={{
+          display: "grid",
+          gap: 12,
+        }}
+      >
+        <div
+          style={{
+            fontSize: 13,
+            color: "#a7a7a7",
+            lineHeight: 1.55,
+          }}
+        >
+          <div>
+            Active fingerprint:{" "}
+            <strong style={{ color: "#e5e5e5" }}>
+              {bootstrapStatus
+                ? `${bootstrapStatus.sha256.slice(0, 12)}…`
+                : "Loading…"}
+            </strong>
+          </div>
+
+          {bootstrapStatus && (
+            <>
+              <div>
+                Size:{" "}
+                {Math.round(
+                  bootstrapStatus.size_bytes / 1024,
+                )}{" "}
+                KB
+              </div>
+
+              <div>
+                Previous revision:{" "}
+                {bootstrapStatus.previous_available
+                  ? "Available"
+                  : "None"}
+              </div>
+            </>
+          )}
+        </div>
+
+        
+
+        <label
+          htmlFor="bootstrap-file-input"
+          style={{
+            display: "block",
+            textAlign: "center",
+            border: "1px solid #514663",
+            borderRadius: 12,
+            padding: "12px 14px",
+            background: bootstrapBusy
+              ? "#18151d"
+              : "#251d30",
+            color: bootstrapBusy
+              ? "#777"
+              : "#d3b7f3",
+            fontSize: 14,
+            fontWeight: 750,
+            cursor: bootstrapBusy
+              ? "default"
+              : "pointer",
+          }}
+        >
+          {bootstrapBusy
+            ? "Processing Bootstrap..."
+            : "Update Bootstrap"}
+        </label>
+
+        <input
+          id="bootstrap-file-input"
+          type="file"
+          accept=".md,.txt,text/markdown,text/plain"
+          disabled={bootstrapBusy}
+          style={{ display: "none" }}
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+
+            if (file) {
+              void reviewBootstrapFile(file);
+            }
+
+            event.currentTarget.value = "";
+          }}
+        />
+
+        {pendingBootstrap && (
+          <div
+            style={{
+              border: "1px solid #514663",
+              borderRadius: 12,
+              padding: 14,
+              background: "#110b18",
+              display: "grid",
+              gap: 10,
+            }}
+          >
+            <div
+              style={{
+                fontSize: 12,
+                letterSpacing: 0.8,
+                color: "#c7a6e8",
+                fontWeight: 800,
+              }}
+            >
+              BOOTSTRAP REVISION DETECTED
+            </div>
+
+            <div
+              style={{
+                fontSize: 13,
+                color: "#bbb",
+                lineHeight: 1.6,
+              }}
+            >
+              <div>
+                Current:{" "}
+                <strong>
+                  {bootstrapStatus
+                    ? `${bootstrapStatus.sha256.slice(0, 12)}…`
+                    : "Unknown"}
+                </strong>
+              </div>
+
+              <div>
+                New:{" "}
+                <strong>
+                  {pendingBootstrap.fingerprint.slice(0, 12)}…
+                </strong>
+              </div>
+
+              <div>Required sections: ✓</div>
+              <div>Browser validation: ✓</div>
+              <div>Current version will be backed up: ✓</div>
+            </div>
+
+            <button
+              type="button"
+              disabled={bootstrapBusy}
+              onClick={() => void confirmBootstrapInstall()}
+              style={{
+                border: "1px solid #315f42",
+                borderRadius: 10,
+                padding: "11px 12px",
+                background: bootstrapBusy
+                  ? "#151515"
+                  : "#102517",
+                color: bootstrapBusy
+                  ? "#777"
+                  : "#8fe0a5",
+                fontWeight: 750,
+              }}
+            >
+              {bootstrapBusy
+                ? "Installing..."
+                : "Install Revision"}
+            </button>
+
+            <button
+              type="button"
+              disabled={bootstrapBusy}
+              onClick={() => {
+                setPendingBootstrap(null);
+                setBootstrapMessage("");
+              }}
+              style={{
+                border: "1px solid #3a3a3a",
+                borderRadius: 10,
+                padding: "11px 12px",
+                background: "#151515",
+                color: "#bbb",
+                fontWeight: 700,
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        )}
+
+        <button
+          type="button"
+          disabled={
+            bootstrapBusy ||
+            !bootstrapStatus?.previous_available
+          }
+          onClick={() => void rollbackBootstrap()}
+          style={{
+            border: "1px solid #493f3f",
+            borderRadius: 12,
+            padding: "12px 14px",
+            background:
+              bootstrapStatus?.previous_available &&
+              !bootstrapBusy
+                ? "#261919"
+                : "#151515",
+            color:
+              bootstrapStatus?.previous_available &&
+              !bootstrapBusy
+                ? "#e3aaaa"
+                : "#666",
+            fontSize: 14,
+            fontWeight: 700,
+          }}
+        >
+          Restore Previous Bootstrap
+        </button>
+
+        {bootstrapMessage && (
+          <div
+            style={{
+              border: "1px solid #333",
+              borderRadius: 10,
+              padding: "10px 12px",
+              color: "#bdbdbd",
+              fontSize: 13,
+              lineHeight: 1.5,
+            }}
+          >
+            {bootstrapMessage}
+          </div>
+        )}
+
+        <div
+          style={{
+            color: "#777",
+            fontSize: 12,
+            lineHeight: 1.5,
+          }}
+        >
+          Strategy revisions cannot change the Bridge
+          risk ceiling, broker credentials, account
+          connections, or execution permissions.
+        </div>
+      </div>
+    
+          </div>
+        </details>
+      </Card>
+
+    {loading && (
+          <div
+            style={{
+              textAlign: "center",
+              color: "#999",
+              fontSize: 13,
+            }}
+          >
+            Reading live 4H · 1H · 15M · 5M market data
+          </div>
+        )}
+
+        {!loading && lastScan && (
+          <div
+            style={{
+              textAlign: "center",
+              color: "#888",
+              fontSize: 13,
+            }}
+          >
+            Last scan: {lastScan}
+          </div>
+        )}
+
+        {error && (
+          <Card title="ERROR">
+            <div style={{ color: "#ff9d9d" }}>{error}</div>
+          </Card>
+        )}
+
+        {data && (
+          <>
+            <Card title="TRADING STATE">
+            {testState === "EXECUTABLE" ||
+            (testState === "LIVE" && data.executable_orders.length > 0) ? (
+              <div
+                style={{
+                  padding: "14px",
+                  borderRadius: 14,
+                  background: "#102517",
+                  border: "1px solid #275a36",
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: 24,
+                    fontWeight: 850,
+                    color: "#8fe0a5",
+                  }}
+                >
+                  EXECUTABLE
+                </div>
+
+                <div
+                  style={{
+                    marginTop: 6,
+                    color: "#b9d8c1",
+                    lineHeight: 1.45,
+                  }}
+                >
+                  A setup has earned trade approval. Review the
+                  executable order below.
+                </div>
+              </div>
+            ) : testState === "PENDING" ||
+              (testState === "LIVE" && data.pending_setup) ? (
+              <div
+                style={{
+                  padding: "14px",
+                  borderRadius: 14,
+                  background: "#251f10",
+                  border: "1px solid #5a4927",
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: 24,
+                    fontWeight: 850,
+                    color: "#e7c58a",
+                  }}
+                >
+                  PENDING SETUP
+                </div>
+
+                <div
+                  style={{
+                    marginTop: 6,
+                    color: "#d8c7a7",
+                    lineHeight: 1.45,
+                  }}
+                >
+                  {testState === "PENDING"
+                    ? "SIMULATION LONG is armed and waiting for confirmation."
+                    : `${data.pending_setup?.instrument} ${data.pending_setup?.direction} is armed but still waiting for remaining confirmation.`}
+                </div>
+              </div>
+            ) : (
+              <div
+                style={{
+                  padding: "14px",
+                  borderRadius: 14,
+                  background: "#151515",
+                  border: "1px solid #303030",
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: 24,
+                    fontWeight: 850,
+                    color: "#bcbcbc",
+                  }}
+                >
+                  WATCH
+                </div>
+
+                <div
+                  style={{
+                    marginTop: 6,
+                    color: "#8d8d8d",
+                    lineHeight: 1.45,
+                  }}
+                >
+                  No trade is armed. Continue monitoring the strongest
+                  candidates and alerts.
+                </div>
+              </div>
+            )}
+          </Card>
+
+          {(testState === "PENDING" || testState === "EXECUTABLE") && (
+            <Card title="SIMULATED ORDER TICKET">
+              <div
+                style={{
+                  padding: "16px",
+                  borderRadius: 14,
+                  border: "1px solid #333",
+                  background: "#101010",
+                }}
+              >
+                <div
+                  style={{
+                    color: "#777",
+                    fontSize: 11,
+                    fontWeight: 800,
+                    letterSpacing: 1,
+                    marginBottom: 14,
+                  }}
+                >
+                  TEST DATA · NOT A LIVE ORDER
+                </div>
+
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "1fr 1fr",
+                    gap: 10,
+                  }}
+                >
+                  {[
+                    ["ORDER TYPE", testState === "PENDING" ? "Pending" : "Active"],
+                    ["INSTRUMENT", "SIMULATION"],
+                    ["ENTRY", "100.00"],
+                    ["SAFE LOSS", "99.00"],
+                    ["TAKE PROFIT 1", "100.75"],
+                    ["TAKE PROFIT 2", "101.50"],
+                  ].map(([label, value]) => (
+                    <div
+                      key={label}
+                      style={{
+                        padding: "12px",
+                        borderRadius: 10,
+                        border: "1px solid #292929",
+                      }}
+                    >
+                      <div
+                        style={{
+                          color: "#777",
+                          fontSize: 10,
+                          marginBottom: 6,
+                        }}
+                      >
+                        {label}
+                      </div>
+
+                      <div
+                        style={{
+                          color: "#f2f2f2",
+                          fontSize: 17,
+                          fontWeight: 800,
+                        }}
+                      >
+                        {value}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div
+            style={{
+              marginTop: 14,
+              paddingTop: 14,
+              borderTop: "1px solid #275a36",
+            }}
+          >
+            <div
+              style={{
+                fontSize: 12,
+                fontWeight: 800,
+                color: "#8fe0a5",
+                marginBottom: 10,
+              }}
+            >
+              APPROVAL REQUIRED
+            </div>
+
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "1fr 1fr",
+                gap: 8,
+              }}
+            >
+              {[
+                ["App", "Approve trade"],
+                ["App + Exp", "Approve and explain trade"],
+                ["Exp", "Explain trade"],
+                ["Rej", "Reject trade"],
+                ["App All", "Approve across all connected accounts"],
+              ].map(([label, title]) => (
+                <button
+                  key={label}
+                  type="button"
+                  title={title}
+                  onClick={() => {
+                    void submitApprovalAction(
+                      label,
+                      "SIMULATION",
+                      "Challenge",
+                      {
+                        direction: "LONG",
+                        entry: 100.0,
+                        safe_loss: 99.0,
+                        take_profit_1: 100.75,
+                        take_profit_2: 101.5,
+                      },
+                    );
+                  }}
+                  style={{
+                    minHeight: 42,
+                    borderRadius: 10,
+                    border: "1px solid #3b3b3b",
+                    background: "#181818",
+                    color: "#f5f5f5",
+                    fontWeight: 800,
+                    fontSize: 12,
+                    padding: "8px 10px",
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {approvalMessage && (
+              <div
+                style={{
+                  marginTop: 10,
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  background: "#121212",
+                  border: "1px solid #303030",
+                  color: "#d8d8d8",
+                  fontSize: 12,
+                  lineHeight: 1.45,
+                }}
+              >
+                {approvalMessage}
+              </div>
+            )}
+          </div>
+
+          <div
+                  style={{
+                    marginTop: 14,
+                    padding: "10px",
+                    borderRadius: 9,
+                    background: "#281313",
+                    color: "#d99a9a",
+                    fontSize: 12,
+                    lineHeight: 1.4,
+                  }}
+                >
+                  Simulation only. These prices must never be used as a
+                  trading instruction.
+                </div>
+              </div>
+            </Card>
+          )}
+
+          <Card title="PENDING SETUP">
+              {data.pending_setup ? (
+                <div>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: 12,
+                    }}
+                  >
+                    <div>
+                      <div
+                        style={{
+                          fontSize: 22,
+                          fontWeight: 800,
+                        }}
+                      >
+                        {data.pending_setup.instrument}
+                      </div>
+
+                      <div
+                        style={{
+                          marginTop: 4,
+                          color: "#8d8d8d",
+                          fontSize: 13,
+                        }}
+                      >
+                        {data.pending_setup.direction} · {data.pending_setup.status}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div
+                    style={{
+                      marginTop: 16,
+                      display: "grid",
+                      gridTemplateColumns: "1fr 1fr",
+                      gap: 10,
+                    }}
+                  >
+                    {[
+                      ["Entry", data.pending_setup.entry_reference],
+                      ["Safe Loss", data.pending_setup.safe_loss],
+                      ["TP1", data.pending_setup.tp1],
+                      ["TP3", data.pending_setup.tp3],
+                      ["TP2", data.pending_setup.tp2],
+                      ["R:R TP1", data.pending_setup.rr_tp1],
+                      ["R:R TP3", data.pending_setup.rr_tp3],
+                      ["R:R TP2", data.pending_setup.rr_tp2],
+                    ].map(([label, value]) => (
+                      <div
+                        key={String(label)}
+                        style={{
+                          background: "#101010",
+                          border: "1px solid #2b2b2b",
+                          borderRadius: 12,
+                          padding: 11,
+                        }}
+                      >
+                        <div
+                          style={{
+                            color: "#777",
+                            fontSize: 11,
+                            textTransform: "uppercase",
+                          }}
+                        >
+                          {label}
+                        </div>
+
+                        <div
+                          style={{
+                            marginTop: 5,
+                            fontWeight: 700,
+                          }}
+                        >
+                          {value ?? "—"}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {data.pending_setup.requirements_remaining.length > 0 && (
+            <div
+              style={{
+                marginTop: 14,
+                padding: 12,
+                borderRadius: 12,
+                background: "#251f10",
+                border: "1px solid #514225",
+              }}
+            >
+              <div
+                style={{
+                  color: "#e7c58a",
+                  fontSize: 12,
+                  fontWeight: 800,
+                  marginBottom: 8,
+                }}
+              >
+                STILL REQUIRED
+              </div>
+
+              <div
+                style={{
+                  color: "#d8b27b",
+                  fontSize: 13,
+                  lineHeight: 1.5,
+                }}
+              >
+                {data.pending_setup.requirements_remaining.map((item) => (
+                  <div key={item}>○ {item}</div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {data.pending_setup.requirements_satisfied.length > 0 && (
+            <div
+              style={{
+                marginTop: 12,
+                padding: 12,
+                borderRadius: 12,
+                background: "#102017",
+                border: "1px solid #21452d",
+              }}
+            >
+              <div
+                style={{
+                  color: "#8fe0a5",
+                  fontSize: 12,
+                  fontWeight: 800,
+                  marginBottom: 8,
+                }}
+              >
+                ALREADY SATISFIED
+              </div>
+
+              <div
+                style={{
+                  color: "#b8d8c0",
+                  fontSize: 13,
+                  lineHeight: 1.5,
+                }}
+              >
+                {data.pending_setup.requirements_satisfied.map((item) => (
+                  <div key={item}>✓ {item}</div>
+                ))}
+              </div>
+            </div>
+          )}
+
+                          </div>
+          ) : (
+                <div>
+                  <div
+                    style={{
+                      fontSize: 20,
+                      fontWeight: 700,
+                    }}
+                  >
+                    None armed.
+                  </div>
+
+                  <div
+                    style={{
+                      marginTop: 6,
+                      color: "#8d8d8d",
+                      lineHeight: 1.5,
+                    }}
+                  >
+                    The top candidate has not yet produced valid trade geometry.
+                  </div>
+                </div>
+              )}
+            </Card>
+
+                    <Card title="SCAN STATUS">
+              <div style={{ fontSize: 18, fontWeight: 700 }}>
+                {data.successful}/{data.requested} markets scanned
+              </div>
+              <div
+                style={{
+                  marginTop: 5,
+                  color: "#8d8d8d",
+                }}
+              >
+                {data.failed === 0
+                  ? "All requested markets returned successfully."
+                  : `${data.failed} market scan(s) failed.`}
+              </div>
+            </Card>
+
+            {data.top_candidate && (
+              <Card title="TOP CANDIDATE">
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    gap: 12,
+                  }}
+                >
+                  <div>
+                    <div
+                      style={{
+                        fontSize: 24,
+                        fontWeight: 800,
+                      }}
+                    >
+                      {data.top_candidate.instrument}
+                    </div>
+
+                    <div
+                      style={{
+                        marginTop: 5,
+                        color: "#8d8d8d",
+                        fontSize: 13,
+                      }}
+                    >
+                      {data.top_candidate.state} · {data.top_candidate.grade}
+                    </div>
+                  </div>
+
+                  <BiasBadge bias={data.top_candidate.bias} />
+                </div>
+
+                <div
+                  style={{
+                    marginTop: 16,
+                    display: "flex",
+                    alignItems: "baseline",
+                    gap: 8,
+                  }}
+                >
+                  <div
+                    style={{
+                      fontSize: 34,
+                      fontWeight: 850,
+                    }}
+                  >
+                    {data.top_candidate.score}
+                  </div>
+
+                  <div
+                    style={{
+                      color: "#777",
+                      fontSize: 13,
+                    }}
+                  >
+                    candidate score
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    marginTop: 18,
+                    display: "grid",
+                    gridTemplateColumns: "1fr 1fr",
+                    gap: 10,
+                  }}
+                >
+                  {[
+                    ["Price", data.top_candidate.current_price],
+                    ["Entry quality", data.top_candidate.entry_quality],
+                    ["Invalidation", data.top_candidate.invalidation],
+                    ["Target", data.top_candidate.target_reference],
+                    ["R:R", data.top_candidate.reward_to_risk],
+                    ["Extension", data.top_candidate.extension],
+                  ].map(([label, value]) => (
+                    <div
+                      key={String(label)}
+                      style={{
+                        background: "#101010",
+                        border: "1px solid #2b2b2b",
+                        borderRadius: 12,
+                        padding: 11,
+                      }}
+                    >
+                      <div
+                        style={{
+                          color: "#777",
+                          fontSize: 11,
+                          textTransform: "uppercase",
+                          letterSpacing: 0.7,
+                        }}
+                      >
+                        {label}
+                      </div>
+
+                      <div
+                        style={{
+                          marginTop: 5,
+                          fontWeight: 700,
+                          fontSize: 15,
+                        }}
+                      >
+                        {value ?? "—"}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div
+                  style={{
+                    marginTop: 14,
+                    padding: "10px 12px",
+                    borderRadius: 12,
+                    background: data.top_candidate["5m_confirmed"]
+                      ? "#102517"
+                      : "#251b10",
+                    color: data.top_candidate["5m_confirmed"]
+                      ? "#8fe0a5"
+                      : "#e7c58a",
+                    fontSize: 13,
+                  }}
+                >
+                  5M confirmation:{" "}
+                  {data.top_candidate["5m_confirmed"]
+                    ? "Confirmed"
+                    : "Not confirmed"}
+                </div>
+
+                {(() => {
+                  const blockers: string[] = [];
+
+                  if (data.top_candidate.entry_quality === "late") {
+                    blockers.push("late entry");
+                  }
+
+                  if (
+                    data.top_candidate.reward_to_risk !== null &&
+                    data.top_candidate.reward_to_risk < 1
+                  ) {
+                    blockers.push("weak R:R");
+                  }
+
+                  if (!data.top_candidate["5m_confirmed"]) {
+                    blockers.push("5M not confirmed");
+                  }
+
+                  if (
+                    data.top_candidate.extension === "extended" ||
+                    data.top_candidate.extension === "highly_extended"
+                  ) {
+                    blockers.push("price extended");
+                  }
+
+                  if (data.top_candidate.state === "transitioning") {
+                    blockers.push("multi-horizon transition");
+                  }
+
+                  if (blockers.length === 0) {
+                    return null;
+                  }
+
+                  return (
+                    <div
+                      style={{
+                        marginTop: 12,
+                        padding: "11px 12px",
+                        borderRadius: 12,
+                        background: "#221313",
+                        border: "1px solid #482020",
+                        color: "#ffb0b0",
+                        fontSize: 13,
+                        lineHeight: 1.45,
+                      }}
+                    >
+                      <strong>Why not a trade?</strong>
+                      <div style={{ marginTop: 4 }}>
+                        Blocked by: {blockers.join(" · ")}
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {data.top_candidate.next_conditions.length > 0 && (
+                  <div
+                    style={{
+                      marginTop: 12,
+                      padding: "12px",
+                      borderRadius: 12,
+                      background: "#161616",
+                      border: "1px solid #303030",
+                    }}
+                  >
+                    <div
+                      style={{
+                        fontSize: 13,
+                        fontWeight: 800,
+                        marginBottom: 8,
+                      }}
+                    >
+                      What needs to happen?
+                    </div>
+
+                    <div
+                      style={{
+                        display: "grid",
+                        gap: 7,
+                        color: "#d0d0d0",
+                        fontSize: 13,
+                        lineHeight: 1.45,
+                      }}
+                    >
+                      {data.top_candidate.next_conditions.map((condition) => (
+                        <div key={condition}>• {condition}</div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {data.top_candidate.satisfied_conditions.length > 0 && (
+                  <div
+                    style={{
+                      marginTop: 12,
+                      padding: "12px",
+                      borderRadius: 12,
+                      background: "#102017",
+                      border: "1px solid #21452d",
+                    }}
+                  >
+                    <div
+                      style={{
+                        fontSize: 13,
+                        fontWeight: 800,
+                        color: "#8fe0a5",
+                        marginBottom: 8,
+                      }}
+                    >
+                      Already satisfied
+                    </div>
+
+                    <div
+                      style={{
+                        display: "grid",
+                        gap: 7,
+                        color: "#b8d8c0",
+                        fontSize: 13,
+                        lineHeight: 1.45,
+                      }}
+                    >
+                      {data.top_candidate.satisfied_conditions.map(
+                        (condition) => (
+                          <div key={condition}>✓ {condition}</div>
+                        )
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                <div
+                  style={{
+                    marginTop: 14,
+                    color: "#c4c4c4",
+                    lineHeight: 1.5,
+                  }}
+                >
+                  {data.top_candidate.reason}
+                </div>
+
+                <div
+                  style={{
+                    marginTop: 12,
+                    color: "#777",
+                    fontSize: 12,
+                  }}
+                >
+                  Ranking indicates attention priority, not trade approval.
+                </div>
+              </Card>
+            )}
+
+            {data.top_candidate && (
+              <Card title="QUALIFICATION PROGRESS">
+                <div
+                  style={{
+                    display: "grid",
+                    gap: 12,
+                  }}
+                >
+                  {[
+                    {
+                      label: "Entry quality",
+                      value: data.top_candidate.entry_quality,
+                      passed:
+                        data.top_candidate.entry_quality === "efficient" ||
+                        data.top_candidate.entry_quality === "acceptable",
+                    },
+                    {
+                      label: "TP1 R:R",
+                      value:
+                        data.top_candidate.rr_tp1 == null
+                          ? "—"
+                          : `${data.top_candidate.rr_tp1} / 0.75`,
+                      passed:
+                        data.top_candidate.rr_tp1 != null &&
+                        data.top_candidate.rr_tp1 >= 0.75,
+                    },
+                    {
+                      label: "TP2 R:R",
+                      value:
+                        data.top_candidate.rr_tp2 == null
+                          ? "—"
+                          : `${data.top_candidate.rr_tp2} / 1.50`,
+                      passed:
+                        data.top_candidate.rr_tp2 != null &&
+                        data.top_candidate.rr_tp2 >= 1.5,
+                    },
+                    {
+                      label: "5M confirmation",
+                      value: data.top_candidate["5m_confirmed"]
+                        ? "Confirmed"
+                        : "Missing",
+                      passed: data.top_candidate["5m_confirmed"],
+                    },
+                    {
+                      label: "Extension",
+                      value: data.top_candidate.extension,
+                      passed:
+                        data.top_candidate.extension !== "extended" &&
+                        data.top_candidate.extension !== "highly_extended",
+                    },
+                    {
+                      label: "Multi-horizon state",
+                      value: data.top_candidate.state,
+                      passed: data.top_candidate.state !== "transitioning",
+                    },
+                  ].map((item) => (
+                    <div
+                      key={item.label}
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: 14,
+                        padding: "11px 12px",
+                        borderRadius: 12,
+                        background: "#101010",
+                        border: "1px solid #2b2b2b",
+                      }}
+                    >
+                      <div>
+                        <div
+                          style={{
+                            color: "#8d8d8d",
+                            fontSize: 11,
+                            textTransform: "uppercase",
+                            letterSpacing: 0.7,
+                          }}
+                        >
+                          {item.label}
+                        </div>
+
+                        <div
+                          style={{
+                            marginTop: 4,
+                            fontWeight: 700,
+                            fontSize: 15,
+                          }}
+                        >
+                          {item.value}
+                        </div>
+                      </div>
+
+                      <div
+                        style={{
+                          minWidth: 30,
+                          textAlign: "center",
+                          fontSize: 18,
+                          fontWeight: 800,
+                          color: item.passed ? "#8fe0a5" : "#e7a1a1",
+                        }}
+                      >
+                        {item.passed ? "✓" : "○"}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div
+                  style={{
+                    marginTop: 12,
+                    color: "#777",
+                    fontSize: 12,
+                    lineHeight: 1.45,
+                  }}
+                >
+                  Progress is informational only. Trade approval still requires
+                  the full backend strategy gate.
+                </div>
+              </Card>
+            )}
+
+            <Card title="EXECUTABLE ORDERS">
+              {data.executable_orders.length === 0 ? (
+                <div>
+                  <div
+                    style={{
+                      fontSize: 20,
+                      fontWeight: 700,
+                    }}
+                  >
+                    No trade yet.
+                  </div>
+                  <div
+                    style={{
+                      color: "#8d8d8d",
+                      marginTop: 6,
+                    }}
+                  >
+                    No setup currently meets the executable threshold.
+                  </div>
+                </div>
+              ) : (
+                <div style={{ display: "grid", gap: 12 }}>
+                  {data.executable_orders.map((order) => (
+                    <div
+                      key={order.instrument}
+                      style={{
+                        border: "1px solid #275a36",
+                        background: "#102517",
+                        borderRadius: 14,
+                        padding: 15,
+                      }}
+                    >
+                      <div
+                        style={{
+                          fontSize: 20,
+                          fontWeight: 800,
+                          marginBottom: 10,
+                        }}
+                      >
+                        {order.instrument}
+                      </div>
+
+                <div
+                  style={{
+                    color: "#8fe0a5",
+                    fontSize: 12,
+                    fontWeight: 800,
+                    marginBottom: 8,
+                  }}
+                >
+                  {order.order_type}
+                </div>
+
+                      <div>Entry: {order.entry}</div>
+                      <div>Safe Loss: {order.safe_loss}</div>
+                      <div>Take Profit 1: {order.take_profit_1}</div>
+                      <div>Take Profit 3: {order.take_profit_3}</div>
+                      <div>Take Profit 2: {order.take_profit_2}</div>
+
+                <div
+                  style={{
+                    marginTop: 14,
+                    paddingTop: 14,
+                    borderTop: "1px solid #275a36",
+                  }}
+                >
+                  <div
+                    style={{
+                      fontSize: 12,
+                      fontWeight: 800,
+                      color: "#8fe0a5",
+                      marginBottom: 10,
+                    }}
+                  >
+                    APPROVAL REQUIRED
+                  </div>
+
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "1fr 1fr",
+                      gap: 8,
+                    }}
+                  >
+                    {[
+                      ["App", "Approve trade"],
+                      ["App + Exp", "Approve and explain trade"],
+                      ["Exp", "Explain trade"],
+                      ["Rej", "Reject trade"],
+                      ["App All", "Approve across all connected accounts"],
+                    ].map(([label, title]) => (
+                      <button
+                        key={label}
+                        type="button"
+                        title={title}
+                        onClick={() => {
+                          void submitApprovalAction(
+                            label,
+                            order.instrument,
+                            "Challenge",
+                          );
+                        }}
+                        style={{
+                          minHeight: 42,
+                          borderRadius: 10,
+                          border: "1px solid #3b3b3b",
+                          background: "#181818",
+                          color: "#f5f5f5",
+                          fontWeight: 800,
+                          fontSize: 12,
+                          padding: "8px 10px",
+                        }}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div
+                    style={{
+                      marginTop: 9,
+                      color: "#8d8d8d",
+                      fontSize: 11,
+                      lineHeight: 1.4,
+                    }}
+                  >
+                    Approval controls are currently UI-only. No trade is sent
+                    by these buttons yet.
+                  </div>
+                </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </Card>
+
+            <Card title={`ALERTS · ${data.alerts.length}`}>
+        <details>
+          <summary
+            style={{
+              cursor: "pointer",
+              border: "1px solid #303030",
+              borderRadius: 12,
+              padding: "12px 14px",
+              background: "#141414",
+              color: "#c7c7c7",
+              fontSize: 14,
+              fontWeight: 800,
+              listStyle: "none",
+            }}
+          >
+            Show Alert Details
+          </summary>
+
+          <div style={{ marginTop: 12 }}>
+
+              {data.alerts.length === 0 ? (
+                <div style={{ color: "#999" }}>No active alerts.</div>
+              ) : (
+                <div style={{ display: "grid", gap: 12 }}>
+                  {data.alerts.map((alert) => (
+                    <div
+                      key={`${alert.instrument}-${alert.alert_level}`}
+                      style={{
+                        border: "1px solid #303030",
+                        borderRadius: 14,
+                        padding: 15,
+                        background: "#101010",
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          gap: 10,
+                        }}
+                      >
+                        <div
+                          style={{
+                            fontSize: 20,
+                            fontWeight: 800,
+                          }}
+                        >
+                          {alert.instrument}
+                        </div>
+
+                        <BiasBadge bias={alert.bias} />
+                      </div>
+
+                      <div
+                        style={{
+                          fontSize: 27,
+                          fontWeight: 800,
+                          marginTop: 12,
+                        }}
+                      >
+                        {alert.alert_level}
+                      </div>
+
+                      <div
+                        style={{
+                          color: "#aaa",
+                          marginTop: 6,
+                          lineHeight: 1.45,
+                        }}
+                      >
+                        {alert.meaning}
+                      </div>
+
+                      <div
+                        style={{
+                          marginTop: 10,
+                          color: "#727272",
+                          fontSize: 12,
+                        }}
+                      >
+                        {alert.state} · {alert.grade}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            
+          </div>
+        </details>
+      </Card>
+
+            <Card title={`WATCHLIST · ${data.watchlist.length}`}>
+        <details>
+          <summary
+            style={{
+              cursor: "pointer",
+              border: "1px solid #303030",
+              borderRadius: 12,
+              padding: "12px 14px",
+              background: "#141414",
+              color: "#c7c7c7",
+              fontSize: 14,
+              fontWeight: 800,
+              listStyle: "none",
+            }}
+          >
+            Show Watchlist Details
+          </summary>
+
+          <div style={{ marginTop: 12 }}>
+
+              {data.watchlist.length === 0 ? (
+                <div style={{ color: "#999" }}>
+                  No additional markets waiting for confirmation.
+                </div>
+              ) : (
+                <div style={{ display: "grid", gap: 12 }}>
+                  {data.watchlist.map((item) => (
+                    <div
+                      key={item.instrument}
+                      style={{
+                        border: "1px solid #303030",
+                        borderRadius: 14,
+                        padding: 15,
+                        background: "#101010",
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: 10,
+                        }}
+                      >
+                        <div
+                          style={{
+                            fontSize: 20,
+                            fontWeight: 800,
+                          }}
+                        >
+                          {item.instrument}
+                        </div>
+
+                        <BiasBadge bias={item.bias} />
+                      </div>
+
+                      <div
+                        style={{
+                          marginTop: 8,
+                          color: "#8d8d8d",
+                          fontSize: 13,
+                        }}
+                      >
+                        {item.state} · {item.decision}
+                      </div>
+
+                      <div
+                        style={{
+                          marginTop: 10,
+                          color: "#c7c7c7",
+                          lineHeight: 1.5,
+                        }}
+                      >
+                        {item.reason}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            
+          </div>
+        </details>
+      </Card>
+          </>
+        )}
+      </div>
+    </main>
+  );
+}

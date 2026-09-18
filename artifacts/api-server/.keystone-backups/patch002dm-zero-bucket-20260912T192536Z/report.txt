@@ -1,0 +1,44 @@
+Keystone 002D-M read-only diagnostic
+UTC 20260912T192536Z
+
+LIVE_OK: pwd=/home/runner/workspace; artifacts/api-server/app/routes/exports.py exists.
+
+OBJECTS AND INIT
+- export_timings.py:10-20 defines StageTimer(ContextDecorator); exit appends {name, ms, nested} to a sink list. record_span is lines 22-23.
+- exports.py:735-742 initializes per-export _timings_ms = dict[str,float] = {} plus stage clocks.
+- exports.py:744-749 _finish_stage computes perf_counter elapsed and assigns _timings_ms[name]. Aliases: stage_1_account_and_connector/account_instrument_resolution; stage_2_market_discovery/other_discovery; stage_3_scanner/discovery; stage_4_analysis/candidate_analysis; stage_5_payload_assembly/payload_assembly; stage_6_truth_layer/truth_layer; stage_7_bootstrap_and_response/bootstrap_status.
+- exports.py:4079-4099 creates job created_perf and _patch002dj_clock with created and queued.
+
+MUTATION
+- exports.py:3985-3998 mutates _patch002dj_clock task_start, export_start, export_done.
+- exports.py:4028-4030 mutates logical_complete and ready_visible.
+- exports.py:3909 copies _timings_ms into diagnostics.patch002dj_timings_ms.
+
+SERIALIZATION
+- exports.py:4004 json.loads(response.body) creates new dict _job_payload.
+- exports.py:4031 assigns diagnostics.patch002dj_timings = build_patch002dj(job, export_payload=_job_payload)[patch002dj_timings]. This is a fresh object and overwrites/rebuilds the final field.
+- exports.py:4047-4048 assigns coarse total_created_to_ready_ms only after the builder call.
+
+BUILDER DEFINITION
+export_timings.py:50-63 build_patch002dj reads diagnostics then t=d.get("timing_ms",{}) at line 52, but t is unused. It computes total from _patch002dj_clock created to ready_visible. Line 61 lists all requested lifecycle buckets. Line 62 hardcodes top=[{name:n, ms:0.0, nested:False} for n in names]. Line 63 returns top_level_sum_ms=0, residual_ms=total, residual_pct=100 when total exists, coverage_pct=0, nested=[].
+
+CAUSE
+All named buckets stay zero because the builder never consumes _timings_ms or diagnostics.patch002dj_timings_ms. It creates a fresh zero skeleton. The live clock is retained and used only for aggregate total/residual, so READY jobs can show about 122 seconds wall time while allocation is 0 percent. This affects every requested top-level bucket and leaves nested empty.
+
+OBJECT CONTINUITY
+NO. _timings_ms survives only in the scan handler, is copied by dict() into patch002dj_timings_ms, then response JSON is parsed into a new _job_payload, and build_patch002dj creates/replaces patch002dj_timings. The lifecycle clock is a separate job dict.
+
+HYPOTHESES
+Mutation on copy: YES, but not sole cause. Overwrite by new default: YES at exports.py:4031. Serialize different object: YES. Async task loses state: NO evidence; clock has complete timestamps. Elapsed computed but not assigned to output buckets: YES. Key mismatch: YES; producer uses patch002dj_timings_ms while builder looks for timing_ms, and the local t is unused. Final report resets buckets: YES. _patch002dj_clock spelling matches.
+
+SYNTHETIC TESTS
+No HTTP, broker, Challenge, or production export calls. Controlled build_patch002dj with created=1.0 and ready_visible=123.0 plus supplied patch002dj_timings_ms returned created_to_ready_ms=122000.0, all top ms=0.0, sum=0, residual=122000, residual_pct=100, coverage=0, nested=[]. StageTimer and record_span isolated smoke test worked: controlled sleeps produced about 10.1 ms and 5.08 ms entries.
+
+SMALLEST PROPOSED CORRECTION (NOT APPLIED)
+Use one canonical timing object/schema, feed _timings_ms and lifecycle clock intervals into explicit requested bucket mappings, and serialize that same object once at final persistence. Remove hardcoded zero list and key mismatch. Measurement-only; no production trading/broker semantics need change.
+
+SAFETY
+Source changes: NO; production .py files were not edited. git status showed inspected paths as pre-existing untracked files, not modifications made here. Challenge exports: 0. Broker calls: 0. Only reads, hashes, and local helper tests were done; evidence files are the only writes.
+
+OBSERVED JOB 5130f4174ead4f1ea0a2df99e93c73e2
+Read-only jobs.json inspection: status READY; _patch002dj_clock had created 21485.57373063, export_start about 21485.68184805, export_done about 21607.45396151, logical_complete about 21607.46463850, ready_visible about 21607.46463850; total_created_to_ready_ms=121890.937. This confirms the aggregate wall clock exists independently of the zero bucket allocation.

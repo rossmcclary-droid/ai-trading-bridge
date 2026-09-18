@@ -1,0 +1,87 @@
+{
+  "patch": "002D-J",
+  "clock": {
+    "time_source": "perf_counter",
+    "created_to_ready_ms": null
+  },
+  "top_level": {
+    "job_creation": {
+      "ms": 10.0,
+      "source": "clock.created_to_queued"
+    },
+    "accepted_queued": {
+      "ms": 10.0,
+      "source": "clock.queued_to_task_start"
+    },
+    "export_function_start": {
+      "ms": 10.0,
+      "source": "clock.task_start_to_export_start"
+    },
+    "discovery": {
+      "ms": null,
+      "source": null
+    },
+    "quote_gather": {
+      "ms": null,
+      "source": null
+    },
+    "shortlist_selection": {
+      "ms": null,
+      "source": null
+    },
+    "deep_analysis": {
+      "ms": null,
+      "source": null
+    },
+    "per_symbol_history_timeframe_fetches": {
+      "ms": null,
+      "source": null
+    },
+    "enrichment": {
+      "ms": null,
+      "source": null
+    },
+    "truth_layer": {
+      "ms": null,
+      "source": null
+    },
+    "bootstrap_verification": {
+      "ms": null,
+      "source": null
+    },
+    "payload_assembly_serialization": {
+      "ms": 1.25,
+      "source": "job.payload_assembly_serialization_ms"
+    },
+    "durable_result_write": {
+      "ms": 2.5,
+      "source": "job.durable_result_write_ms"
+    },
+    "durable_ready_transition": {
+      "ms": 10.0,
+      "source": "clock.logical_complete_to_ready_visible"
+    },
+    "logical_complete_to_visible_ready": {
+      "ms": 10.0,
+      "source": "clock.logical_complete_to_ready_visible"
+    }
+  },
+  "top_level_sum_ms": 53.75,
+  "nested_timings": {},
+  "nested_spans_are_not_in_top_level": true,
+  "residual_ms": null,
+  "residual_pct": 0.0,
+  "coverage_pct": 0.0,
+  "non_overlapping": true,
+  "unmapped_top_level_buckets": [
+    "discovery",
+    "quote_gather",
+    "shortlist_selection",
+    "deep_analysis",
+    "per_symbol_history_timeframe_fetches",
+    "enrichment",
+    "truth_layer",
+    "bootstrap_verification"
+  ],
+  "source_timing_key": "patch002dj_timings_ms"
+}

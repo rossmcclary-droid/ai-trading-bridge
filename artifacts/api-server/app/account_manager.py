@@ -1,0 +1,55 @@
+"""Read-only account registry."""
+
+from app.models.account import (
+    Account,
+    ConnectionStatus,
+    Environment,
+    Platform,
+)
+
+
+class AccountManager:
+    """Provides account metadata without mutating broker or local state."""
+
+    def __init__(self) -> None:
+        self._accounts: tuple[Account, ...] = (
+            Account(
+                internal_id="acct_demo1",
+                nickname="Demo1",
+                platform=Platform.TRADELOCKER,
+                environment=Environment.DEMO,
+                broker="TradeLocker Demo",
+                connection_status=ConnectionStatus.NOT_CONNECTED,
+            ),
+            Account(
+                internal_id="acct_challenge",
+                nickname="Challenge",
+                platform=Platform.TRADELOCKER,
+                environment=Environment.DEMO,
+                broker="TradeLocker",
+                external_account_id="2390586",
+                external_account_number="10",
+                connection_status=ConnectionStatus.NOT_CONNECTED,
+            ),
+        )
+
+    def list_accounts(self) -> list[Account]:
+        """Return all configured accounts."""
+
+        return list(self._accounts)
+
+    def get_account(self, nickname: str) -> Account | None:
+        """Return an account by nickname, case-insensitively."""
+
+        normalized_nickname = nickname.casefold()
+        return next(
+            (
+                account
+                for account in self._accounts
+                if account.nickname.casefold() == normalized_nickname
+            ),
+            None,
+        )
+
+
+account_manager = AccountManager()

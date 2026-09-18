@@ -1,0 +1,1252 @@
+"""Deterministic technical analysis for Trading Brain market scans."""
+
+from __future__ import annotations
+
+from typing import Any
+
+
+def normalize_bars(payload: dict[str, Any]) -> list[dict[str, float]]:
+    """Convert TradeLocker barDetails into normalized OHLCV bars."""
+
+    raw_bars = payload.get("d", {}).get("barDetails", [])
+
+    bars: list[dict[str, float]] = []
+
+    for bar in raw_bars:
+        try:
+            bars.append(
+                {
+                    "timestamp": int(bar["t"]),
+                    "open": float(bar["o"]),
+                    "high": float(bar["h"]),
+                    "low": float(bar["l"]),
+                    "close": float(bar["c"]),
+                    "volume": float(bar.get("v", 0.0)),
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    bars.sort(key=lambda item: item["timestamp"])
+
+    return bars
+
+
+def calculate_rsi(
+    bars: list[dict[str, float]],
+    period: int = 14,
+) -> float | None:
+    """Calculate Wilder RSI from closing prices."""
+
+    if len(bars) < period + 1:
+        return None
+
+    closes = [bar["close"] for bar in bars]
+
+    gains: list[float] = []
+    losses: list[float] = []
+
+    for index in range(1, len(closes)):
+        change = closes[index] - closes[index - 1]
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
+
+    average_gain = sum(gains[:period]) / period
+    average_loss = sum(losses[:period]) / period
+
+    for index in range(period, len(gains)):
+        average_gain = (
+            (average_gain * (period - 1)) + gains[index]
+        ) / period
+
+        average_loss = (
+            (average_loss * (period - 1)) + losses[index]
+        ) / period
+
+    if average_loss == 0:
+        if average_gain == 0:
+            return 50.0
+        return 100.0
+
+    relative_strength = average_gain / average_loss
+
+    return 100.0 - (100.0 / (1.0 + relative_strength))
+
+
+def classify_structure(
+    bars: list[dict[str, float]],
+    lookback: int = 20,
+) -> str:
+    """Classify recent price structure using range position and slope."""
+
+    if len(bars) < 5:
+        return "insufficient_data"
+
+    sample = bars[-lookback:]
+
+    first_close = sample[0]["close"]
+    last_close = sample[-1]["close"]
+
+    highest = max(bar["high"] for bar in sample)
+    lowest = min(bar["low"] for bar in sample)
+
+    price_range = highest - lowest
+
+    if price_range <= 0:
+        return "neutral"
+
+    position = (last_close - lowest) / price_range
+    change = last_close - first_close
+
+    if change > 0 and position >= 0.60:
+        return "bullish"
+
+    if change < 0 and position <= 0.40:
+        return "bearish"
+
+    return "neutral"
+
+
+def momentum_state(rsi: float | None) -> str:
+    """Convert RSI into a simple momentum state."""
+
+    if rsi is None:
+        return "unknown"
+
+    if rsi >= 60:
+        return "bullish"
+
+    if rsi <= 40:
+        return "bearish"
+
+    return "neutral"
+
+
+def analyze_timeframe(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Analyze one TradeLocker candle timeframe."""
+
+    bars = normalize_bars(payload)
+
+    if not bars:
+        return {
+            "candle_count": 0,
+            "last_price": None,
+            "rsi_14": None,
+            "momentum": "unknown",
+            "structure": "insufficient_data",
+        }
+
+    rsi = calculate_rsi(bars)
+
+    return {
+        "candle_count": len(bars),
+        "last_price": bars[-1]["close"],
+        "rsi_14": round(rsi, 2) if rsi is not None else None,
+        "momentum": momentum_state(rsi),
+        "structure": classify_structure(bars),
+    }
+
+
+def _direction(result: dict[str, Any]) -> str:
+    """Resolve a timeframe's directional state from structure and momentum."""
+
+    structure = result.get("structure")
+    momentum = result.get("momentum")
+
+    if structure == momentum and structure in {"bullish", "bearish"}:
+        return structure
+
+    if structure in {"bullish", "bearish"} and momentum == "neutral":
+        return structure
+
+    if momentum in {"bullish", "bearish"} and structure == "neutral":
+        return momentum
+
+    return "neutral"
+
+
+def classify_multi_horizon_state(
+    analyses: dict[str, Any],
+) -> tuple[str, str]:
+    """Classify Bootstrap v2 multi-horizon state conservatively."""
+
+    d4h = _direction(analyses.get("4H", {}))
+    d1h = _direction(analyses.get("1H", {}))
+    d15m = _direction(analyses.get("15M", {}))
+    d5m = _direction(analyses.get("5M", {}))
+
+    higher = [d for d in (d4h, d1h) if d != "neutral"]
+
+    if len(higher) == 2 and higher[0] == higher[1]:
+        bias = higher[0]
+
+        if d15m == bias and d5m == bias:
+            return "aligned", bias
+
+        if d15m != bias and d15m != "neutral":
+            if d5m == bias:
+                return "reconverging", bias
+            return "pulling_back", bias
+
+        if d15m in {"neutral", bias} and d5m not in {"neutral", bias}:
+            return "pulling_back", bias
+
+        if d15m == bias and d5m == "neutral":
+            return "reconverging", bias
+
+        return "transitioning", bias
+
+    if d4h != "neutral" and d1h != "neutral" and d4h != d1h:
+        # Bootstrap v2 treats 4H/1H disagreement as a possible
+        # deeper correction or structural transition, not an
+        # automatic rejection.
+        return "transitioning", "neutral"
+
+    if d1h != "neutral":
+        return "transitioning", d1h
+
+    if d4h != "neutral":
+        return "transitioning", d4h
+
+    return "conflicted", "neutral"
+
+
+def classify_setup(
+    *,
+    state: str,
+    bias: str,
+    analyses: dict[str, Any],
+) -> tuple[str, str, str]:
+    """Map current evidence to Bootstrap grade/decision conservatively."""
+
+    if state == "conflicted":
+        return (
+            "REJECT",
+            "REJECT",
+            "Directional evidence is materially conflicted and lacks sufficient edge.",
+        )
+
+    if state == "transitioning" and bias == "neutral":
+        return (
+            "C",
+            "WATCH",
+            "4H and 1H directional structure disagree; treat this as a possible "
+            "deeper correction or structural transition until the 15M/5M clarify.",
+        )
+
+    if state == "aligned":
+        return (
+            "C",
+            "WATCH",
+            "Directional alignment exists, but entry location, invalidation, "
+            "volatility and room-to-target are not yet evaluated.",
+        )
+
+    if state == "reconverging":
+        return (
+            "C",
+            "ALERT ONLY",
+            "Momentum reconvergence is developing, but execution evidence "
+            "is incomplete.",
+        )
+
+    if state == "pulling_back":
+        return (
+            "C",
+            "WATCH",
+            "Higher-horizon bias remains intact while lower horizons pull "
+            "back; wait for reconvergence.",
+        )
+
+    return (
+        "C",
+        "WATCH",
+        "Directional opportunity is transitioning and has not earned "
+        "trade approval.",
+    )
+
+
+def analyze_scan(
+    scan: dict[str, Any],
+) -> dict[str, Any]:
+    """Analyze every timeframe and classify Bootstrap v2 scan state."""
+
+    analyses: dict[str, Any] = {}
+
+    for timeframe, payload in scan["timeframes"].items():
+        analyses[timeframe] = analyze_timeframe(payload)
+
+    state, bias = classify_multi_horizon_state(analyses)
+
+    grade, decision, reason = classify_setup(
+        state=state,
+        bias=bias,
+        analyses=analyses,
+    )
+
+    return {
+        "symbol": scan["symbol"],
+        "directional_bias": bias,
+        "multi_horizon_state": state,
+        "setup_grade": grade,
+        "decision": decision,
+        "reason": reason,
+        "timeframes": analyses,
+    }
+
+
+def calculate_atr(
+    bars: list[dict[str, float]],
+    period: int = 14,
+) -> float | None:
+    """Calculate a simple Wilder-style ATR."""
+
+    if len(bars) < period + 1:
+        return None
+
+    true_ranges: list[float] = []
+
+    for i in range(1, len(bars)):
+        current = bars[i]
+        previous = bars[i - 1]
+
+        true_range = max(
+            current["high"] - current["low"],
+            abs(current["high"] - previous["close"]),
+            abs(current["low"] - previous["close"]),
+        )
+
+        true_ranges.append(true_range)
+
+    atr = sum(true_ranges[:period]) / period
+
+    for tr in true_ranges[period:]:
+        atr = ((atr * (period - 1)) + tr) / period
+
+    return atr
+
+
+def structural_context(
+    bars: list[dict[str, float]],
+    lookback: int = 20,
+) -> dict[str, Any]:
+    """Return recent structural boundaries and price location."""
+
+    if len(bars) < 5:
+        return {
+            "recent_high": None,
+            "recent_low": None,
+            "range_position": None,
+            "distance_to_high": None,
+            "distance_to_low": None,
+        }
+
+    sample = bars[-lookback:]
+
+    recent_high = max(bar["high"] for bar in sample)
+    recent_low = min(bar["low"] for bar in sample)
+    current = sample[-1]["close"]
+
+    span = recent_high - recent_low
+
+    range_position = (
+        (current - recent_low) / span
+        if span > 0
+        else 0.5
+    )
+
+    return {
+        "recent_high": recent_high,
+        "recent_low": recent_low,
+        "range_position": range_position,
+        "distance_to_high": recent_high - current,
+        "distance_to_low": current - recent_low,
+    }
+
+
+def extension_state(
+    *,
+    bars: list[dict[str, float]],
+    atr: float | None,
+    structure: dict[str, Any],
+) -> str:
+    """Classify whether price is stretched relative to recent volatility."""
+
+    if not bars or atr is None or atr <= 0:
+        return "unknown"
+
+    current = bars[-1]["close"]
+
+    recent_high = structure.get("recent_high")
+    recent_low = structure.get("recent_low")
+
+    if recent_high is None or recent_low is None:
+        return "unknown"
+
+    distance_from_mid = abs(
+        current - ((recent_high + recent_low) / 2)
+    )
+
+    atr_multiple = distance_from_mid / atr
+
+    if atr_multiple >= 3.0:
+        return "highly_extended"
+
+    if atr_multiple >= 2.0:
+        return "extended"
+
+    return "normal"
+
+
+def analyze_execution_context(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Calculate structure, volatility and entry-location evidence."""
+
+    bars = normalize_bars(payload)
+
+    if not bars:
+        return {
+            "atr_14": None,
+            "recent_high": None,
+            "recent_low": None,
+            "range_position": None,
+            "distance_to_high": None,
+            "distance_to_low": None,
+            "extension": "unknown",
+        }
+
+    atr = calculate_atr(bars)
+    structure = structural_context(bars)
+
+    return {
+        "atr_14": round(atr, 6) if atr is not None else None,
+        "recent_high": structure["recent_high"],
+        "recent_low": structure["recent_low"],
+        "range_position": (
+            round(structure["range_position"], 4)
+            if structure["range_position"] is not None
+            else None
+        ),
+        "distance_to_high": structure["distance_to_high"],
+        "distance_to_low": structure["distance_to_low"],
+        "extension": extension_state(
+            bars=bars,
+            atr=atr,
+            structure=structure,
+        ),
+    }
+
+
+def evaluate_trade_geometry(
+    payload: dict[str, Any],
+    *,
+    bias: str,
+) -> dict[str, Any]:
+    """Evaluate structural entry efficiency and target room."""
+
+    bars = normalize_bars(payload)
+
+    if not bars:
+        return {
+            "entry_quality": "unknown",
+            "invalidation": None,
+            "target_reference": None,
+            "room_to_target": None,
+            "risk_distance": None,
+            "reward_to_risk": None,
+        }
+
+    context = analyze_execution_context(payload)
+
+    current = bars[-1]["close"]
+    recent_high = context["recent_high"]
+    recent_low = context["recent_low"]
+    range_position = context["range_position"]
+
+    if (
+        recent_high is None
+        or recent_low is None
+        or range_position is None
+    ):
+        return {
+            "entry_quality": "unknown",
+            "invalidation": None,
+            "target_reference": None,
+            "room_to_target": None,
+            "risk_distance": None,
+            "reward_to_risk": None,
+        }
+
+    if bias == "bullish":
+        invalidation = recent_low
+        target_reference = recent_high
+        risk_distance = current - invalidation
+        room_to_target = target_reference - current
+
+        if range_position <= 0.35:
+            entry_quality = "efficient"
+        elif range_position <= 0.60:
+            entry_quality = "acceptable"
+        else:
+            entry_quality = "late"
+
+    elif bias == "bearish":
+        invalidation = recent_high
+        target_reference = recent_low
+        risk_distance = invalidation - current
+        room_to_target = current - target_reference
+
+        if range_position >= 0.65:
+            entry_quality = "efficient"
+        elif range_position >= 0.40:
+            entry_quality = "acceptable"
+        else:
+            entry_quality = "late"
+
+    else:
+        return {
+            "entry_quality": "unknown",
+            "invalidation": None,
+            "target_reference": None,
+            "room_to_target": None,
+            "risk_distance": None,
+            "reward_to_risk": None,
+        }
+
+    reward_to_risk = None
+
+    if risk_distance > 0:
+        reward_to_risk = room_to_target / risk_distance
+
+    return {
+        "entry_quality": entry_quality,
+        "invalidation": invalidation,
+        "target_reference": target_reference,
+        "room_to_target": room_to_target,
+        "risk_distance": risk_distance,
+        "reward_to_risk": (
+            round(reward_to_risk, 2)
+            if reward_to_risk is not None
+            else None
+        ),
+    }
+
+
+def analyze_scan(
+    scan: dict[str, Any],
+) -> dict[str, Any]:
+    """Bootstrap v2 analysis with grading override and execution geometry."""
+
+    analyses: dict[str, Any] = {}
+
+    for timeframe, payload in scan["timeframes"].items():
+        analyses[timeframe] = analyze_timeframe(payload)
+
+    state, bias = classify_multi_horizon_state(analyses)
+
+    # Evaluate execution geometry primarily from the 15M setup horizon.
+    geometry = evaluate_trade_geometry(
+        scan["timeframes"]["15M"],
+        bias=bias,
+    )
+
+    execution_context = analyze_execution_context(
+        scan["timeframes"]["15M"]
+    )
+
+    entry_quality = geometry["entry_quality"]
+    reward_to_risk = geometry["reward_to_risk"]
+    extension = execution_context["extension"]
+
+    # Conservative grading while executable setup validation is incomplete.
+    grade = "WATCH"
+    decision = "WATCH"
+
+    if state == "conflicted":
+        grade = "REJECT"
+        decision = "REJECT"
+        reason = (
+            "Directional evidence is materially conflicted and lacks "
+            "sufficient edge."
+        )
+
+    elif state == "transitioning" and bias == "neutral":
+        reason = (
+            "4H and 1H directional structure disagree; treat this as a "
+            "possible deeper correction or structural transition until "
+            "15M/5M clarify."
+        )
+
+    elif state == "pulling_back":
+        reason = (
+            "Higher-horizon bias remains intact while lower horizons pull "
+            "back; wait for momentum reconvergence."
+        )
+
+    elif state == "reconverging":
+        decision = "ALERT ONLY"
+        reason = (
+            "Momentum reconvergence is developing, but execution evidence "
+            "has not yet earned an executable grade."
+        )
+
+    elif state == "aligned":
+        if extension in {"extended", "highly_extended"}:
+            reason = (
+                "Trend alignment is present, but price is extended relative "
+                "to recent volatility. Trend valid — entry invalid."
+            )
+        elif entry_quality == "late":
+            reason = (
+                "Directional alignment is present, but current entry location "
+                "is inefficient."
+            )
+        elif reward_to_risk is not None and reward_to_risk < 1.25:
+            reason = (
+                "Directional alignment is present, but room to target is "
+                "insufficient relative to structural risk."
+            )
+        else:
+            reason = (
+                "Directional alignment and geometry are promising, but "
+                "invalidation, target structure and execution confirmation "
+                "still require validation before an executable grade."
+            )
+
+    else:
+        reason = (
+            "The setup has not earned approval under the current "
+            "multi-horizon evidence."
+        )
+
+    return {
+        "symbol": scan["symbol"],
+        "directional_bias": bias,
+        "multi_horizon_state": state,
+        "setup_grade": grade,
+        "decision": decision,
+        "reason": reason,
+        "geometry": geometry,
+        "execution_context": execution_context,
+        "timeframes": analyses,
+    }
+
+
+def derive_trade_plan(
+    scan: dict[str, Any],
+    *,
+    bias: str,
+) -> dict[str, Any]:
+    """Derive conservative structural invalidation and target references."""
+
+    if bias not in {"bullish", "bearish"}:
+        return {
+            "entry_reference": None,
+            "safe_loss": None,
+            "tp1": None,
+            "tp2": None,
+            "risk_distance": None,
+            "reward_to_tp1": None,
+            "reward_to_tp2": None,
+            "rr_tp1": None,
+            "rr_tp2": None,
+            "valid": False,
+            "reason": "No directional bias is established.",
+        }
+
+    bars_15m = normalize_bars(scan["timeframes"]["15M"])
+    bars_1h = normalize_bars(scan["timeframes"]["1H"])
+
+    if not bars_15m or not bars_1h:
+        return {
+            "entry_reference": None,
+            "safe_loss": None,
+            "tp1": None,
+            "tp2": None,
+            "risk_distance": None,
+            "reward_to_tp1": None,
+            "reward_to_tp2": None,
+            "rr_tp1": None,
+            "rr_tp2": None,
+            "valid": False,
+            "reason": "Insufficient 15M/1H structure.",
+        }
+
+    current = bars_15m[-1]["close"]
+
+    ctx_15m = structural_context(bars_15m)
+    ctx_1h = structural_context(bars_1h)
+
+    if bias == "bullish":
+        safe_loss = min(
+            ctx_15m["recent_low"],
+            ctx_1h["recent_low"],
+        )
+        tp1 = ctx_15m["recent_high"]
+        tp2 = ctx_1h["recent_high"]
+
+        risk_distance = current - safe_loss
+        reward_to_tp1 = tp1 - current
+        reward_to_tp2 = tp2 - current
+
+    else:
+        safe_loss = max(
+            ctx_15m["recent_high"],
+            ctx_1h["recent_high"],
+        )
+        tp1 = ctx_15m["recent_low"]
+        tp2 = ctx_1h["recent_low"]
+
+        risk_distance = safe_loss - current
+        reward_to_tp1 = current - tp1
+        reward_to_tp2 = current - tp2
+
+    if risk_distance <= 0:
+        return {
+            "entry_reference": current,
+            "safe_loss": safe_loss,
+            "tp1": tp1,
+            "tp2": tp2,
+            "risk_distance": risk_distance,
+            "reward_to_tp1": reward_to_tp1,
+            "reward_to_tp2": reward_to_tp2,
+            "rr_tp1": None,
+            "rr_tp2": None,
+            "valid": False,
+            "reason": "Structural invalidation is not positioned correctly.",
+        }
+
+    rr_tp1 = reward_to_tp1 / risk_distance
+    rr_tp2 = reward_to_tp2 / risk_distance
+
+    valid = (
+        reward_to_tp1 > 0
+        and reward_to_tp2 > 0
+        and rr_tp1 >= 0.75
+        and rr_tp2 >= 1.50
+    )
+
+    return {
+        "entry_reference": current,
+        "safe_loss": safe_loss,
+        "tp1": tp1,
+        "tp2": tp2,
+        "risk_distance": risk_distance,
+        "reward_to_tp1": reward_to_tp1,
+        "reward_to_tp2": reward_to_tp2,
+        "rr_tp1": round(rr_tp1, 2),
+        "rr_tp2": round(rr_tp2, 2),
+        "valid": valid,
+        "reason": (
+            "Structural trade geometry is viable."
+            if valid
+            else "Structural reward relative to risk is insufficient."
+        ),
+    }
+
+
+def analyze_scan(
+    scan: dict[str, Any],
+) -> dict[str, Any]:
+    """Bootstrap v2 analysis with geometry and structural trade-plan validation."""
+
+    analyses: dict[str, Any] = {}
+
+    for timeframe, payload in scan["timeframes"].items():
+        analyses[timeframe] = analyze_timeframe(payload)
+
+    state, bias = classify_multi_horizon_state(analyses)
+
+    geometry = evaluate_trade_geometry(
+        scan["timeframes"]["15M"],
+        bias=bias,
+    )
+
+    execution_context = analyze_execution_context(
+        scan["timeframes"]["15M"]
+    )
+
+    trade_plan = derive_trade_plan(
+        scan,
+        bias=bias,
+    )
+
+    grade = "WATCH"
+    decision = "WATCH"
+
+    if state == "conflicted":
+        grade = "REJECT"
+        decision = "REJECT"
+        reason = (
+            "Directional evidence is materially conflicted and lacks "
+            "sufficient edge."
+        )
+
+    elif state == "transitioning" and bias == "neutral":
+        reason = (
+            "4H and 1H directional structure disagree; possible deeper "
+            "correction or structural transition. Wait for 15M/5M clarity."
+        )
+
+    elif state == "pulling_back":
+        reason = (
+            "Higher-horizon bias remains intact while lower horizons pull "
+            "back. Wait for momentum reconvergence."
+        )
+
+    elif state == "reconverging":
+        decision = "ALERT ONLY"
+
+        if not trade_plan["valid"]:
+            reason = (
+                "Momentum reconvergence is developing, but structural "
+                "reward-to-risk is not yet sufficient."
+            )
+        else:
+            reason = (
+                "Momentum reconvergence and structural geometry are "
+                "developing. Execution confirmation is still required."
+            )
+
+    elif state == "aligned":
+        extension = execution_context["extension"]
+        entry_quality = geometry["entry_quality"]
+
+        if extension in {"extended", "highly_extended"}:
+            reason = (
+                "Trend valid but entry is extended relative to recent "
+                "volatility. Wait for a reset."
+            )
+
+        elif entry_quality == "late":
+            reason = (
+                "Directional alignment is present, but entry location is late."
+            )
+
+        elif not trade_plan["valid"]:
+            reason = (
+                "Directional alignment is present, but structural "
+                "reward-to-risk is insufficient."
+            )
+
+        else:
+            reason = (
+                "Directional alignment and structural geometry are viable, "
+                "but final 5M execution confirmation is still required."
+            )
+            decision = "ALERT ONLY"
+
+    else:
+        reason = (
+            "The setup has not earned approval under current "
+            "multi-horizon evidence."
+        )
+
+    return {
+        "symbol": scan["symbol"],
+        "directional_bias": bias,
+        "multi_horizon_state": state,
+        "setup_grade": grade,
+        "decision": decision,
+        "reason": reason,
+        "geometry": geometry,
+        "execution_context": execution_context,
+        "trade_plan": trade_plan,
+        "timeframes": analyses,
+    }
+
+
+def evaluate_5m_execution(
+    payload: dict[str, Any],
+    *,
+    bias: str,
+) -> dict[str, Any]:
+    """Evaluate conservative 5M execution confirmation."""
+
+    bars = normalize_bars(payload)
+
+    if bias not in {"bullish", "bearish"}:
+        return {
+            "confirmed": False,
+            "structure_shift": False,
+            "rsi_confirmed": False,
+            "candle_confirmed": False,
+            "reason": "No directional bias is established.",
+        }
+
+    if len(bars) < 20:
+        return {
+            "confirmed": False,
+            "structure_shift": False,
+            "rsi_confirmed": False,
+            "candle_confirmed": False,
+            "reason": "Insufficient 5M candle history.",
+        }
+
+    rsi = calculate_rsi(bars)
+
+    recent = bars[-6:]
+    current = recent[-1]
+    previous = recent[-2]
+
+    prior_high = max(bar["high"] for bar in recent[:-1])
+    prior_low = min(bar["low"] for bar in recent[:-1])
+
+    if bias == "bullish":
+        structure_shift = (
+            current["close"] > previous["high"]
+            or current["close"] > prior_high
+        )
+
+        rsi_confirmed = (
+            rsi is not None
+            and rsi >= 50
+        )
+
+        candle_confirmed = (
+            current["close"] > current["open"]
+            and current["close"] >= previous["close"]
+        )
+
+    else:
+        structure_shift = (
+            current["close"] < previous["low"]
+            or current["close"] < prior_low
+        )
+
+        rsi_confirmed = (
+            rsi is not None
+            and rsi <= 50
+        )
+
+        candle_confirmed = (
+            current["close"] < current["open"]
+            and current["close"] <= previous["close"]
+        )
+
+    confirmed = (
+        structure_shift
+        and rsi_confirmed
+        and candle_confirmed
+    )
+
+    if confirmed:
+        reason = "5M structure, RSI and candle confirmation agree."
+    elif structure_shift:
+        reason = "5M structure shifted, but momentum/candle confirmation is incomplete."
+    elif rsi_confirmed and candle_confirmed:
+        reason = "5M momentum is aligned, but a structural trigger is still missing."
+    else:
+        reason = "5M execution confirmation is incomplete."
+
+    return {
+        "confirmed": confirmed,
+        "structure_shift": structure_shift,
+        "rsi_confirmed": rsi_confirmed,
+        "candle_confirmed": candle_confirmed,
+        "rsi_14": round(rsi, 2) if rsi is not None else None,
+        "reason": reason,
+    }
+
+
+def analyze_scan(
+    scan: dict[str, Any],
+) -> dict[str, Any]:
+    """Bootstrap v2 analysis with executable B+ gating."""
+
+    analyses: dict[str, Any] = {}
+
+    for timeframe, payload in scan["timeframes"].items():
+        analyses[timeframe] = analyze_timeframe(payload)
+
+    state, bias = classify_multi_horizon_state(analyses)
+
+    geometry = evaluate_trade_geometry(
+        scan["timeframes"]["15M"],
+        bias=bias,
+    )
+
+    execution_context = analyze_execution_context(
+        scan["timeframes"]["15M"]
+    )
+
+    trade_plan = derive_trade_plan(
+        scan,
+        bias=bias,
+    )
+
+    execution_5m = evaluate_5m_execution(
+        scan["timeframes"]["5M"],
+        bias=bias,
+    )
+
+    grade = "WATCH"
+    decision = "WATCH"
+
+    if state == "conflicted":
+        grade = "REJECT"
+        decision = "REJECT"
+        reason = (
+            "Directional evidence is materially conflicted and lacks "
+            "sufficient edge."
+        )
+
+    elif state == "transitioning" and bias == "neutral":
+        reason = (
+            "4H and 1H directional structure disagree; possible deeper "
+            "correction or structural transition. Wait for 15M/5M clarity."
+        )
+
+    elif state == "pulling_back":
+        reason = (
+            "Higher-horizon bias remains intact while lower horizons pull "
+            "back. Wait for momentum reconvergence."
+        )
+
+    elif (
+        bias in {"bullish", "bearish"}
+        and state in {"aligned", "reconverging"}
+        and trade_plan["valid"]
+        and execution_5m["confirmed"]
+        and execution_context["extension"] == "normal"
+        and geometry["entry_quality"] in {"efficient", "acceptable"}
+    ):
+        grade = "B+"
+        decision = "APPROVED ACTIVE TRADE"
+        reason = (
+            "Directional state, structural geometry and 5M execution "
+            "confirmation satisfy the minimum executable threshold."
+        )
+
+    elif state == "reconverging":
+        decision = "ALERT ONLY"
+
+        if not trade_plan["valid"]:
+            reason = (
+                "Momentum reconvergence is developing, but structural "
+                "reward-to-risk is not yet sufficient."
+            )
+        elif not execution_5m["confirmed"]:
+            reason = (
+                "Momentum reconvergence is developing and geometry is viable, "
+                "but the 5M execution trigger is incomplete."
+            )
+        else:
+            reason = (
+                "Momentum reconvergence is developing, but the setup has not "
+                "met all executable requirements."
+            )
+
+    elif state == "aligned":
+        if execution_context["extension"] in {
+            "extended",
+            "highly_extended",
+        }:
+            reason = (
+                "Trend valid but entry is extended relative to recent "
+                "volatility. Wait for a reset."
+            )
+
+        elif geometry["entry_quality"] == "late":
+            reason = (
+                "Directional alignment is present, but entry location is late."
+            )
+
+        elif not trade_plan["valid"]:
+            reason = (
+                "Directional alignment is present, but structural "
+                "reward-to-risk is insufficient."
+            )
+
+        elif not execution_5m["confirmed"]:
+            decision = "ALERT ONLY"
+            reason = (
+                "Directional alignment and trade geometry are viable, but "
+                "the 5M execution trigger is incomplete."
+            )
+
+        else:
+            reason = (
+                "The setup has not met every executable requirement."
+            )
+
+    else:
+        reason = (
+            "The setup has not earned approval under current "
+            "multi-horizon evidence."
+        )
+
+    return {
+        "symbol": scan["symbol"],
+        "directional_bias": bias,
+        "multi_horizon_state": state,
+        "setup_grade": grade,
+        "decision": decision,
+        "reason": reason,
+        "geometry": geometry,
+        "execution_context": execution_context,
+        "trade_plan": trade_plan,
+        "execution_5m": execution_5m,
+        "timeframes": analyses,
+    }
+
+
+def derive_alert_level(
+    scan: dict[str, Any],
+    *,
+    bias: str,
+    state: str,
+) -> dict[str, Any]:
+    """Derive a conservative price level for reassessment."""
+
+    bars_5m = normalize_bars(scan["timeframes"]["5M"])
+    bars_15m = normalize_bars(scan["timeframes"]["15M"])
+
+    if bias not in {"bullish", "bearish"}:
+        return {
+            "alert_level": None,
+            "alert_type": None,
+            "meaning": "No directional bias is established.",
+        }
+
+    if len(bars_5m) < 6 or len(bars_15m) < 6:
+        return {
+            "alert_level": None,
+            "alert_type": None,
+            "meaning": "Insufficient structure for an alert level.",
+        }
+
+    recent_5m = bars_5m[-6:]
+    recent_15m = bars_15m[-12:]
+
+    if bias == "bullish":
+        micro_trigger = max(bar["high"] for bar in recent_5m[:-1])
+        setup_trigger = max(bar["high"] for bar in recent_15m[:-1])
+
+        if state == "reconverging":
+            return {
+                "alert_level": micro_trigger,
+                "alert_type": "momentum_reconvergence",
+                "meaning": "Bullish 5M reclaim/reconvergence check.",
+            }
+
+        return {
+            "alert_level": min(micro_trigger, setup_trigger),
+            "alert_type": "resistance_break",
+            "meaning": "Bullish structure-break reassessment.",
+        }
+
+    micro_trigger = min(bar["low"] for bar in recent_5m[:-1])
+    setup_trigger = min(bar["low"] for bar in recent_15m[:-1])
+
+    if state == "reconverging":
+        return {
+            "alert_level": micro_trigger,
+            "alert_type": "momentum_reconvergence",
+            "meaning": "Bearish 5M breakdown/reconvergence check.",
+        }
+
+    return {
+        "alert_level": max(micro_trigger, setup_trigger),
+        "alert_type": "support_break",
+        "meaning": "Bearish structure-break reassessment.",
+    }
+
+def derive_alert_levels(
+    scan: dict[str, Any],
+    *,
+    bias: str,
+    state: str,
+) -> list[dict[str, Any]]:
+    """Return distinct, conservative reassessment levels.
+
+    Keeps 5M micro structure and 15M setup structure separate
+    when they produce meaningfully different prices.
+    """
+
+    bars_5m = normalize_bars(scan["timeframes"]["5M"])
+    bars_15m = normalize_bars(scan["timeframes"]["15M"])
+
+    if bias not in {"bullish", "bearish"}:
+        return []
+
+    if len(bars_5m) < 6 or len(bars_15m) < 6:
+        return []
+
+    recent_5m = bars_5m[-6:]
+    recent_15m = bars_15m[-12:]
+
+    if bias == "bullish":
+        micro_trigger = max(
+            bar["high"] for bar in recent_5m[:-1]
+        )
+        setup_trigger = max(
+            bar["high"] for bar in recent_15m[:-1]
+        )
+
+        candidates = [
+            {
+                "alert_level": micro_trigger,
+                "alert_type": "momentum_reconvergence",
+                "meaning": (
+                    "Bullish 5M reclaim/reconvergence check."
+                ),
+            },
+            {
+                "alert_level": setup_trigger,
+                "alert_type": "resistance_break",
+                "meaning": (
+                    "Bullish 15M structure-break reassessment."
+                ),
+            },
+        ]
+
+    else:
+        micro_trigger = min(
+            bar["low"] for bar in recent_5m[:-1]
+        )
+        setup_trigger = min(
+            bar["low"] for bar in recent_15m[:-1]
+        )
+
+        candidates = [
+            {
+                "alert_level": micro_trigger,
+                "alert_type": "momentum_reconvergence",
+                "meaning": (
+                    "Bearish 5M breakdown/reconvergence check."
+                ),
+            },
+            {
+                "alert_level": setup_trigger,
+                "alert_type": "support_break",
+                "meaning": (
+                    "Bearish 15M structure-break reassessment."
+                ),
+            },
+        ]
+
+    # Remove duplicate levels while preserving priority.
+    unique: list[dict[str, Any]] = []
+    seen_levels: set[float] = set()
+
+    for candidate in candidates:
+        level = candidate["alert_level"]
+
+        if level is None:
+            continue
+
+        normalized = round(float(level), 10)
+
+        if normalized in seen_levels:
+            continue
+
+        seen_levels.add(normalized)
+        unique.append(candidate)
+
+    return unique
+
+

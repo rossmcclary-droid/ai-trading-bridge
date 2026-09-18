@@ -1,0 +1,249 @@
+"""Read-only live market scanner service."""
+
+import time
+from typing import Any
+
+from app.connectors.tradelocker import (
+    TradeLockerConfig,
+    TradeLockerConnector,
+)
+
+
+TIMEFRAMES = ("4H", "1H", "15M", "5M")
+
+
+async def _history_with_retry(
+    connector,
+    *,
+    attempts: int = 3,
+    **kwargs,
+):
+    import asyncio
+
+    last_error = None
+
+    for attempt in range(attempts):
+        try:
+            return await connector.get_historical_candles(**kwargs)
+        except Exception as error:
+            last_error = error
+
+            if attempt == attempts - 1:
+                raise
+
+            await asyncio.sleep(3 * (attempt + 1))
+
+    raise last_error
+
+
+class ScannerService:
+    """Collect live market data without modifying broker state."""
+
+    def __init__(self) -> None:
+        self.connector = TradeLockerConnector(
+            TradeLockerConfig.from_environment()
+        )
+
+    async def scan_symbol(
+        self,
+        *,
+        symbol: str,
+        account_id: int,
+        acc_num: str,
+    ) -> dict[str, Any]:
+
+        await self.connector.authenticate()
+
+        instruments_response = (
+            await self.connector.get_available_instruments(
+                account_id=account_id,
+                acc_num=acc_num,
+            )
+        )
+
+        instruments = (
+            instruments_response.get("d", {}).get("instruments", [])
+        )
+
+        instrument = next(
+            (
+                item
+                for item in instruments
+                if str(item.get("name", "")).upper()
+                == symbol.upper()
+            ),
+            None,
+        )
+
+        if instrument is None:
+            raise ValueError(
+                f"Instrument {symbol!r} was not found."
+            )
+
+        tradable_id = instrument.get("tradableInstrumentId")
+
+        info_route = next(
+            (
+                route
+                for route in instrument.get("routes", [])
+                if route.get("type") == "INFO"
+            ),
+            None,
+        )
+
+        if info_route is None:
+            raise ValueError(
+                f"No INFO route found for {symbol}."
+            )
+
+        route_id = info_route["id"]
+
+        now = int(time.time() * 1000)
+
+        lookbacks = {
+            "4H": 14 * 24 * 60 * 60 * 1000,
+            "1H": 7 * 24 * 60 * 60 * 1000,
+            "15M": 2 * 24 * 60 * 60 * 1000,
+            "5M": 12 * 60 * 60 * 1000,
+        }
+
+        candles: dict[str, Any] = {}
+
+        for timeframe in TIMEFRAMES:
+            candles[timeframe] = (
+                await self.connector.get_historical_candles(
+                    account_id=account_id,
+                    acc_num=acc_num,
+                    tradable_instrument_id=tradable_id,
+                    route_id=route_id,
+                    resolution=timeframe,
+                    from_timestamp=now - lookbacks[timeframe],
+                    to_timestamp=now,
+                )
+            )
+
+        return {
+            "symbol": symbol.upper(),
+            "account_id": account_id,
+            "acc_num": acc_num,
+            "tradable_instrument_id": tradable_id,
+            "route_id": route_id,
+            "timeframes": candles,
+        }
+
+
+    async def scan_symbols(
+        self,
+        *,
+        symbols: list[str],
+        account_id: int,
+        acc_num: str,
+    ) -> dict[str, Any]:
+        """Collect multi-timeframe data while respecting broker rate limits."""
+
+        import asyncio
+
+        if len(symbols) > 10:
+            raise ValueError(
+                "A scan may contain no more than 10 symbols."
+            )
+
+        await self.connector.authenticate()
+
+        instruments_response = (
+            await self.connector.get_available_instruments(
+                account_id=account_id,
+                acc_num=acc_num,
+            )
+        )
+
+        instruments = (
+            instruments_response.get("d", {}).get("instruments", [])
+        )
+
+        instrument_map = {
+            str(item.get("name", "")).upper(): item
+            for item in instruments
+        }
+
+        now = int(time.time() * 1000)
+
+        lookbacks = {
+            "4H": 14 * 24 * 60 * 60 * 1000,
+            "1H": 7 * 24 * 60 * 60 * 1000,
+            "15M": 2 * 24 * 60 * 60 * 1000,
+            "5M": 12 * 60 * 60 * 1000,
+        }
+
+        results: dict[str, Any] = {}
+        errors: dict[str, str] = {}
+
+        for symbol in symbols:
+            normalized = symbol.upper()
+
+            try:
+                instrument = instrument_map.get(normalized)
+
+                if instrument is None:
+                    raise ValueError(
+                        f"Instrument {normalized!r} was not found."
+                    )
+
+                tradable_id = instrument.get("tradableInstrumentId")
+
+                info_route = next(
+                    (
+                        route
+                        for route in instrument.get("routes", [])
+                        if route.get("type") == "INFO"
+                    ),
+                    None,
+                )
+
+                if info_route is None:
+                    raise ValueError(
+                        f"No INFO route found for {normalized}."
+                    )
+
+                route_id = info_route["id"]
+                candles: dict[str, Any] = {}
+
+                for timeframe in TIMEFRAMES:
+                    candles[timeframe] = (
+                        await _history_with_retry(
+                            self.connector,
+                            account_id=account_id,
+                            acc_num=acc_num,
+                            tradable_instrument_id=tradable_id,
+                            route_id=route_id,
+                            resolution=timeframe,
+                            from_timestamp=now - lookbacks[timeframe],
+                            to_timestamp=now,
+                        )
+                    )
+
+                    # Avoid bursting TradeLocker's history endpoint.
+                    await asyncio.sleep(1.0)
+
+                results[normalized] = {
+                    "symbol": normalized,
+                    "account_id": account_id,
+                    "acc_num": acc_num,
+                    "tradable_instrument_id": tradable_id,
+                    "route_id": route_id,
+                    "timeframes": candles,
+                }
+
+            except Exception as error:
+                errors[normalized] = str(error)
+
+                # Give the broker extra recovery time after a failure.
+                await asyncio.sleep(1.0)
+
+        return {
+            "results": results,
+            "errors": errors,
+            "requested": len(symbols),
+            "successful": len(results),
+            "failed": len(errors),
+        }

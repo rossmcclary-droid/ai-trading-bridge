@@ -1,0 +1,132 @@
+"""Bootstrap management endpoints.
+
+These endpoints manage strategy-text revisions only.
+They do not modify broker credentials, accounts, risk ceilings,
+approvals, or execution permissions.
+"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+from app.services.bootstrap_manager import (
+    BootstrapRollbackError,
+    BootstrapValidationError,
+    get_bootstrap_status,
+    install_bootstrap,
+    rollback_bootstrap,
+)
+
+
+router = APIRouter(
+    prefix="/bootstrap",
+    tags=["bootstrap"],
+)
+
+
+class BootstrapInstallRequest(BaseModel):
+    content: str
+    source_name: str | None = None
+
+
+def _status_payload(status) -> dict[str, object]:
+    return {
+        "path": status.path,
+        "sha256": status.sha256,
+        "size_bytes": status.size_bytes,
+        "modified_at": status.modified_at,
+        "previous_available": status.previous_available,
+        "previous_filename": status.previous_filename,
+        "restart_required": True,
+    }
+
+
+@router.get("/status")
+async def bootstrap_status() -> dict[str, object]:
+    try:
+        status = get_bootstrap_status()
+    except BootstrapValidationError as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error),
+        ) from error
+
+    return _status_payload(status)
+
+
+@router.post("/install")
+async def bootstrap_install(
+    request: BootstrapInstallRequest,
+) -> dict[str, object]:
+    try:
+        status = install_bootstrap(
+            request.content,
+            source_name=request.source_name,
+        )
+    except BootstrapValidationError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        ) from error
+
+    return {
+        "accepted": True,
+        "message": (
+            "Bootstrap revision installed. "
+            "Restart the backend to load it."
+        ),
+        **_status_payload(status),
+    }
+
+
+@router.post("/rollback")
+async def bootstrap_rollback() -> dict[str, object]:
+    try:
+        status = rollback_bootstrap()
+    except BootstrapRollbackError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        ) from error
+    except BootstrapValidationError as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error),
+        ) from error
+
+    return {
+        "accepted": True,
+        "message": (
+            "Previous Bootstrap restored. "
+            "Restart the backend to load it."
+        ),
+        **_status_payload(status),
+    }
+
+
+# ATLAS_RUNTIME_BOOTSTRAP_HASH_CAPTURE
+# Captures the bootstrap file SHA-256 when this module is imported
+# by the running backend. This is distinct from the mutable on-disk
+# hash reported later by bootstrap_status().
+try:
+    import hashlib as _atlas_bootstrap_hashlib
+    from pathlib import Path as _AtlasBootstrapPath
+
+    _RUNTIME_BOOTSTRAP_FILE = (
+        _AtlasBootstrapPath(__file__).resolve().parents[1]
+        / "brain"
+        / "bootstrap_v2.md"
+    )
+
+    if _RUNTIME_BOOTSTRAP_FILE.exists():
+        _RUNTIME_LOADED_BOOTSTRAP_SHA256 = (
+            _atlas_bootstrap_hashlib.sha256(
+                _RUNTIME_BOOTSTRAP_FILE.read_bytes()
+            ).hexdigest()
+        )
+    else:
+        _RUNTIME_LOADED_BOOTSTRAP_SHA256 = None
+
+except Exception:
+    _RUNTIME_LOADED_BOOTSTRAP_SHA256 = None

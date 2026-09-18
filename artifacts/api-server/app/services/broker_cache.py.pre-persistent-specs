@@ -1,0 +1,118 @@
+"""Small in-memory cache for read-only TradeLocker enrichment data.
+
+Used to reduce broker/API request bursts during AI export.
+
+This cache:
+- stores broker responses with capture timestamps
+- does not submit, modify, or authorize trades
+- expires naturally through TTL checks
+- is process-local and resets when the API restarts
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+
+_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _key(namespace: str, identity: str) -> str:
+    return f"{namespace}:{identity}"
+
+
+def set_cached(
+    namespace: str,
+    identity: str,
+    value: Any,
+) -> None:
+    _CACHE[_key(namespace, identity)] = {
+        "value": value,
+        "captured_at": _utc_now(),
+    }
+
+
+def get_cached(
+    namespace: str,
+    identity: str,
+    *,
+    ttl_seconds: float,
+) -> dict[str, Any] | None:
+    entry = _CACHE.get(_key(namespace, identity))
+
+    if not isinstance(entry, dict):
+        return None
+
+    captured_at = entry.get("captured_at")
+
+    if not isinstance(captured_at, datetime):
+        return None
+
+    age_seconds = (_utc_now() - captured_at).total_seconds()
+
+    if age_seconds > ttl_seconds:
+        return None
+
+    return {
+        "value": entry.get("value"),
+        "captured_at": captured_at.isoformat(),
+        "age_seconds": round(age_seconds, 3),
+    }
+
+
+def get_cached_even_if_stale(
+    namespace: str,
+    identity: str,
+) -> dict[str, Any] | None:
+    entry = _CACHE.get(_key(namespace, identity))
+
+    if not isinstance(entry, dict):
+        return None
+
+    captured_at = entry.get("captured_at")
+
+    if not isinstance(captured_at, datetime):
+        return None
+
+    age_seconds = (_utc_now() - captured_at).total_seconds()
+
+    return {
+        "value": entry.get("value"),
+        "captured_at": captured_at.isoformat(),
+        "age_seconds": round(age_seconds, 3),
+    }
+
+
+def cache_status() -> dict[str, Any]:
+    now = _utc_now()
+    items = {}
+
+    for key, entry in _CACHE.items():
+        captured_at = entry.get("captured_at")
+
+        age_seconds = None
+
+        if isinstance(captured_at, datetime):
+            age_seconds = round(
+                (now - captured_at).total_seconds(),
+                3,
+            )
+
+        items[key] = {
+            "captured_at": (
+                captured_at.isoformat()
+                if isinstance(captured_at, datetime)
+                else None
+            ),
+            "age_seconds": age_seconds,
+        }
+
+    return {
+        "entry_count": len(_CACHE),
+        "entries": items,
+    }

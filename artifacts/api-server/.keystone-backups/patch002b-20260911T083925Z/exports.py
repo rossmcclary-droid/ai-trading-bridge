@@ -1,0 +1,4044 @@
+"""Structured AI market-data export.
+
+Produces a single self-contained JSON file intended for AI trade review.
+
+Read-only:
+- scans market data
+- normalizes candles
+- includes Bridge analysis
+- DOES NOT approve or submit orders
+"""
+
+from __future__ import annotations
+import os
+
+from datetime import datetime, timezone
+import asyncio
+import time
+import json
+import re
+import uuid
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Query, Response
+
+from app.account_manager import AccountManager
+from app.services.analysis import analyze_scan
+from app.services.scanner import ScannerService
+from app.services.market_session import default_tradable_symbols, weekend_crypto_only
+from app.services.broker_cache import (
+    get_cached,
+    get_cached_even_if_stale,
+    set_cached,
+)
+from app.connectors.tradelocker import TradeLockerConnector
+from app.connectors.match_trader import MatchTraderConnector
+from app.services.tradelocker_resolver import (
+    resolve_tradelocker_instrument,
+)
+from app.services.tradelocker_account_state import (
+    map_tradelocker_account_state,
+)
+from app.services.risk_sizing import (
+    MAX_RISK_PERCENT,
+    RiskSizingError,
+    calculate_position_size,
+)
+from app.routes.bootstrap import bootstrap_status
+from app.routes.monitor import monitor_status, mark_alert_review_required
+from app.services.alert_store import (
+    active_alerts,
+    evaluate_alert,
+)
+
+
+router = APIRouter(tags=["ai-export"])
+
+
+TIMEFRAME_SECONDS = {
+    "4H": 4 * 60 * 60,
+    "1H": 60 * 60,
+    "15M": 15 * 60,
+    "5M": 5 * 60,
+}
+
+
+DEFAULT_SYMBOLS = [
+    "XAUUSD",
+    "BTCUSD",
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+]
+
+TIMEFRAMES = ["4H", "1H", "15M", "5M"]
+
+
+def _normalize_candles(
+    payload: Any,
+) -> list[dict[str, Any]]:
+    """Normalize TradeLocker barDetails into explicit OHLCV objects."""
+
+    if not isinstance(payload, dict):
+        return []
+
+    data = payload.get("d")
+
+    if not isinstance(data, dict):
+        return []
+
+    bars = data.get("barDetails")
+
+    if not isinstance(bars, list):
+        return []
+
+    normalized = []
+
+    for bar in bars:
+        if not isinstance(bar, dict):
+            continue
+
+        normalized.append(
+            {
+                "timestamp": bar.get("t"),
+                "open": bar.get("o"),
+                "high": bar.get("h"),
+                "low": bar.get("l"),
+                "close": bar.get("c"),
+                "volume": bar.get("v"),
+            }
+        )
+
+    return normalized
+
+
+def _validate_timeframe_integrity(
+    timeframe_export: dict[str, Any],
+) -> list[str]:
+    """Return hard validation errors for exported timeframe candle data."""
+    errors: list[str] = []
+
+    # Every required timeframe must exist and contain candles.
+    for timeframe in TIMEFRAMES:
+        tf_data = timeframe_export.get(timeframe)
+
+        if not isinstance(tf_data, dict):
+            errors.append(f"{timeframe}: timeframe payload is missing.")
+            continue
+
+        candles = tf_data.get("candles")
+
+        if not isinstance(candles, list) or not candles:
+            errors.append(f"{timeframe}: candle data is missing.")
+            continue
+
+        candle_status = tf_data.get("candle_status")
+
+        if isinstance(candle_status, dict):
+            if bool(candle_status.get("incomplete")):
+                errors.append(f"{timeframe}: candle data is incomplete.")
+
+            if candle_status.get("stale") is True:
+                errors.append(
+                    f"{timeframe}: candle data is stale."
+                )
+
+        expected_seconds = TIMEFRAME_SECONDS.get(timeframe)
+
+        if expected_seconds is not None and len(candles) >= 3:
+            timestamps = [
+                candle.get("timestamp")
+                for candle in candles
+                if isinstance(candle, dict)
+            ]
+
+            positive_gaps = []
+
+            for left, right in zip(timestamps, timestamps[1:]):
+                if not isinstance(left, (int, float)):
+                    continue
+
+                if not isinstance(right, (int, float)):
+                    continue
+
+                gap_ms = right - left
+
+                if gap_ms > 0:
+                    positive_gaps.append(int(gap_ms // 1000))
+
+            if positive_gaps:
+                gap_counts: dict[int, int] = {}
+
+                for gap in positive_gaps:
+                    gap_counts[gap] = gap_counts.get(gap, 0) + 1
+
+                dominant_gap = max(
+                    gap_counts,
+                    key=gap_counts.get,
+                )
+
+                if dominant_gap != expected_seconds:
+                    errors.append(
+                        f"{timeframe}: dominant candle interval is "
+                        f"{dominant_gap}s, expected {expected_seconds}s."
+                    )
+
+    # Different timeframe labels must never contain the exact same
+    # normalized candle series.
+    for index, left_timeframe in enumerate(TIMEFRAMES):
+        left_data = timeframe_export.get(left_timeframe, {})
+        left_candles = (
+            left_data.get("candles")
+            if isinstance(left_data, dict)
+            else None
+        )
+
+        if not isinstance(left_candles, list) or not left_candles:
+            continue
+
+        for right_timeframe in TIMEFRAMES[index + 1:]:
+            right_data = timeframe_export.get(right_timeframe, {})
+            right_candles = (
+                right_data.get("candles")
+                if isinstance(right_data, dict)
+                else None
+            )
+
+            if not isinstance(right_candles, list) or not right_candles:
+                continue
+
+            if left_candles == right_candles:
+                errors.append(
+                    f"{left_timeframe}/{right_timeframe}: "
+                    "distinct timeframe labels contain identical candle data."
+                )
+
+    return errors
+
+
+def _instrument_details_payload(details: Any) -> dict[str, Any] | None:
+    if (
+        isinstance(details, dict)
+        and isinstance(details.get("d"), dict)
+    ):
+        return details["d"]
+
+    if isinstance(details, dict):
+        return details
+
+    return None
+
+
+async def _export_retry(callable_obj, *args, **kwargs):
+    """Pace and retry read-only TradeLocker export requests."""
+
+    last_error = None
+
+    for attempt in range(3):
+        # Keep export enrichment away from TradeLocker burst limits.
+        await asyncio.sleep(1.25)
+
+        try:
+            return await callable_obj(*args, **kwargs)
+
+        except Exception as error:
+            last_error = error
+            message = str(error)
+
+            if attempt >= 2:
+                break
+
+            if "HTTP 429" in message or "rate_limited" in message:
+                await asyncio.sleep(4.0 * (attempt + 1))
+            else:
+                await asyncio.sleep(1.5 * (attempt + 1))
+
+    if last_error is not None:
+        raise last_error
+
+    raise RuntimeError("Export retry failed without an exception.")
+
+
+def _safe_filename_part(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", value).strip("_") or "account"
+
+
+async def _match_trader_cross_reference(
+    tradelocker_instrument: str | None,
+) -> dict[str, Any]:
+    """Fetch fresh Match-Trader data only for platform translation."""
+
+    result: dict[str, Any] = {
+        "role": "translation_cross_reference_only",
+        "affects_tradelocker_trade_decision": False,
+        "available": False,
+        "tradelocker_instrument": tradelocker_instrument,
+        "match_trader_instrument": None,
+        "match_trader_alias": None,
+        "bid": None,
+        "ask": None,
+        "timestamp_ms": None,
+        "mapping_status": "not_attempted",
+        "error": None,
+    }
+
+    if (
+        not isinstance(tradelocker_instrument, str)
+        or not tradelocker_instrument.strip()
+    ):
+        result["mapping_status"] = "no_tradelocker_instrument"
+        return result
+
+    symbol = tradelocker_instrument.strip()
+
+    try:
+        if os.getenv("MATCH_TRADER_ENABLED", "true").strip().lower() not in {"1", "true", "yes", "on"}:
+            result["mapping_status"] = "disabled"
+            result["error"] = "Match-Trader intentionally disabled."
+            return result
+
+        connector = MatchTraderConnector()
+        await connector.authenticate()
+        quotations = await connector.get_quotations([symbol])
+
+        if not isinstance(quotations, list) or not quotations:
+            result["mapping_status"] = "exact_symbol_not_found"
+            result["error"] = (
+                "No Match-Trader quotation was returned for the exact "
+                "TradeLocker instrument name. Symbol translation is required."
+            )
+            return result
+
+        normalized_symbol = symbol.upper()
+
+        matching_quotes = [
+            quote
+            for quote in quotations
+            if isinstance(quote, dict)
+            and (
+                str(quote.get("symbol") or "").strip().upper()
+                == normalized_symbol
+                or str(quote.get("alias") or "").strip().upper()
+                == normalized_symbol
+            )
+        ]
+
+        if not matching_quotes:
+            result["mapping_status"] = "returned_symbol_mismatch"
+            result["error"] = (
+                "Match-Trader returned quotation data, but none of the "
+                "returned symbol/alias values exactly matched the "
+                "TradeLocker instrument. Automatic translation was refused."
+            )
+            return result
+
+        quote = matching_quotes[0]
+
+        result.update(
+            {
+                "available": True,
+                "match_trader_instrument": quote.get("symbol"),
+                "match_trader_alias": quote.get("alias"),
+                "bid": quote.get("bid"),
+                "ask": quote.get("ask"),
+                "timestamp_ms": quote.get("timestampMs"),
+                "mapping_status": "exact_symbol_match",
+            }
+        )
+
+        return result
+
+    except Exception as error:
+        result["mapping_status"] = "match_trader_unavailable"
+        result["error"] = f"{type(error).__name__}: {error}"
+        return result
+
+
+
+
+async def _size_match_trader_trade_plan(
+    translated: dict[str, Any],
+) -> dict[str, Any]:
+    """Size a translated Match-Trader plan using Match-Trader account/spec data."""
+
+    result: dict[str, Any] = {
+        "available": False,
+        "advisory_only": True,
+        "execution_authorized": False,
+        "risk_percent": None,
+        "risk_amount": None,
+        "raw_quantity": None,
+        "calculated_position_size": None,
+        "estimated_stop_risk": None,
+        "account_balance": None,
+        "account_free_margin": None,
+        "account_currency": None,
+        "contract_size": None,
+        "volume_min": None,
+        "volume_step": None,
+        "volume_max": None,
+        "error": None,
+    }
+
+    if (
+        not isinstance(translated, dict)
+        or not translated.get("available")
+        or translated.get("translation_status") != "translated"
+    ):
+        result["error"] = "Translated Match-Trader trade plan unavailable."
+        return result
+
+    plan = translated.get("translated_trade_plan")
+    if not isinstance(plan, dict):
+        result["error"] = "Translated Match-Trader trade plan missing."
+        return result
+
+    instrument = plan.get("instrument")
+    entry = plan.get("entry")
+    safe_loss = plan.get("safe_loss")
+
+    if not isinstance(instrument, str) or not instrument:
+        result["error"] = "Match-Trader instrument is unavailable."
+        return result
+
+    if entry is None or safe_loss is None:
+        result["error"] = "Match-Trader Entry or Safe Loss is unavailable."
+        return result
+
+    try:
+        if os.getenv("MATCH_TRADER_ENABLED", "true").strip().lower() not in {"1", "true", "yes", "on"}:
+            result["error"] = "Match-Trader intentionally disabled."
+            return result
+
+        connector = MatchTraderConnector()
+        await connector.authenticate()
+
+        account_state = await connector.get_account_state(
+            account_id=0,
+            acc_num="",
+        )
+        instruments = await connector.get_available_instruments(
+            account_id=0,
+            acc_num="",
+        )
+
+        spec = next(
+            (
+                item
+                for item in instruments
+                if isinstance(item, dict)
+                and (
+                    str(item.get("symbol") or "").strip().upper()
+                    == instrument.strip().upper()
+                    or str(item.get("alias") or "").strip().upper()
+                    == instrument.strip().upper()
+                )
+            ),
+            None,
+        )
+
+        if not isinstance(spec, dict):
+            result["error"] = (
+                "Match-Trader instrument specifications were not found."
+            )
+            return result
+
+        balance = float(account_state["balance"])
+        free_margin = float(account_state["freeMargin"])
+        account_currency = str(account_state["currency"])
+
+        quote_currency = str(
+            spec.get("quoteCurrency") or ""
+        ).upper()
+
+        if (
+            quote_currency
+            and account_currency.upper() != quote_currency
+        ):
+            result["error"] = (
+                "Currency conversion is required before Match-Trader sizing."
+            )
+            return result
+
+        contract_size = float(spec["contractSize"])
+        volume_step = float(spec["volumeStep"])
+        volume_min = float(spec["volumeMin"])
+        volume_max = float(spec["volumeMax"])
+
+        sizing = calculate_position_size(
+            balance=balance,
+            risk_percent=MAX_RISK_PERCENT,
+            entry=float(entry),
+            safe_loss=float(safe_loss),
+            lot_size=contract_size,
+            lot_step=volume_step,
+            min_lot=volume_min,
+            available_funds=free_margin,
+        )
+
+        quantity = sizing.quantity
+
+        if quantity > volume_max:
+            result["error"] = (
+                "Calculated Match-Trader quantity exceeds broker maximum."
+            )
+            return result
+
+        result.update(
+            {
+                "available": True,
+                "risk_percent": MAX_RISK_PERCENT,
+                "risk_amount": sizing.risk_budget,
+                "raw_quantity": sizing.raw_quantity,
+                "calculated_position_size": quantity,
+                "estimated_stop_risk": sizing.estimated_stop_risk,
+                "account_balance": balance,
+                "account_free_margin": free_margin,
+                "account_currency": account_currency,
+                "contract_size": contract_size,
+                "volume_min": volume_min,
+                "volume_step": volume_step,
+                "volume_max": volume_max,
+            }
+        )
+
+    except Exception as error:
+        result["error"] = f"{type(error).__name__}: {error}"
+
+    return result
+
+
+def _translate_match_trader_trade_plan(
+    frozen_trade_plan: dict[str, Any] | None,
+    exported_instruments: list[dict[str, Any]],
+    match_trader_cross_reference: dict[str, Any],
+) -> dict[str, Any]:
+    """Translate frozen TradeLocker levels to fresh Match-Trader pricing.
+
+    TradeLocker remains canonical. This function never changes the
+    TradeLocker plan and never affects the Atlas trade decision.
+    """
+
+    result: dict[str, Any] = {
+        "role": "price_cross_reference_and_order_translation_only",
+        "affects_tradelocker_trade_decision": False,
+        "match_trader_required_for_decision": False,
+        "match_trader_failure_blocks_tradelocker_order": False,
+        "available": False,
+        "translation_status": "not_attempted",
+        "method": "relative_price_geometry_from_fresh_midpoints",
+        "tradelocker_reference_price": None,
+        "match_trader_reference_price": None,
+        "reference_ratio": None,
+        "match_trader_quote_age_seconds": None,
+        "translated_trade_plan": None,
+        "error": None,
+    }
+
+    if not isinstance(frozen_trade_plan, dict):
+        result["translation_status"] = "no_frozen_trade_plan"
+        return result
+
+    instrument = frozen_trade_plan.get("instrument")
+
+    if not isinstance(instrument, str) or not instrument.strip():
+        result["translation_status"] = "no_tradelocker_instrument"
+        return result
+
+    instrument = instrument.strip()
+
+    exported_instrument = next(
+        (
+            item
+            for item in exported_instruments
+            if isinstance(item, dict)
+            and str(item.get("symbol") or "").strip().upper()
+            == instrument.upper()
+        ),
+        None,
+    )
+
+    if exported_instrument is None:
+        result["translation_status"] = (
+            "fresh_tradelocker_instrument_unavailable"
+        )
+        return result
+
+    market_snapshot = exported_instrument.get("market_snapshot")
+
+    if not isinstance(market_snapshot, dict):
+        result["translation_status"] = (
+            "fresh_tradelocker_market_snapshot_unavailable"
+        )
+        return result
+
+    tl_bid = market_snapshot.get("bid")
+    tl_ask = market_snapshot.get("ask")
+
+    try:
+        tl_bid_f = float(tl_bid)
+        tl_ask_f = float(tl_ask)
+    except (TypeError, ValueError):
+        result["translation_status"] = (
+            "fresh_tradelocker_quote_unavailable"
+        )
+        return result
+
+    if tl_bid_f <= 0 or tl_ask_f <= 0:
+        result["translation_status"] = (
+            "invalid_tradelocker_reference_price"
+        )
+        return result
+
+    if not match_trader_cross_reference.get("available"):
+        result["translation_status"] = "match_trader_unavailable"
+        result["error"] = match_trader_cross_reference.get("error")
+        return result
+
+    if (
+        match_trader_cross_reference.get("mapping_status")
+        != "exact_symbol_match"
+    ):
+        result["translation_status"] = (
+            "match_trader_symbol_not_verified"
+        )
+        return result
+
+    mt_bid = match_trader_cross_reference.get("bid")
+    mt_ask = match_trader_cross_reference.get("ask")
+
+    try:
+        mt_bid_f = float(mt_bid)
+        mt_ask_f = float(mt_ask)
+    except (TypeError, ValueError):
+        result["translation_status"] = (
+            "match_trader_quote_unavailable"
+        )
+        return result
+
+    if mt_bid_f <= 0 or mt_ask_f <= 0:
+        result["translation_status"] = (
+            "invalid_match_trader_reference_price"
+        )
+        return result
+
+    timestamp_ms = match_trader_cross_reference.get("timestamp_ms")
+
+    try:
+        from datetime import datetime, timezone
+
+        quote_time = datetime.fromtimestamp(
+            float(timestamp_ms) / 1000.0,
+            tz=timezone.utc,
+        )
+        quote_age_seconds = (
+            datetime.now(timezone.utc) - quote_time
+        ).total_seconds()
+    except (TypeError, ValueError, OSError, OverflowError):
+        result["translation_status"] = (
+            "match_trader_quote_timestamp_unavailable"
+        )
+        return result
+
+    result["match_trader_quote_age_seconds"] = round(
+        quote_age_seconds,
+        3,
+    )
+
+    # Translation must use a genuinely fresh cross-feed quote.
+    if quote_age_seconds < -5 or quote_age_seconds > 60:
+        result["translation_status"] = "match_trader_quote_stale"
+        return result
+
+    tl_reference = (tl_bid_f + tl_ask_f) / 2.0
+    mt_reference = (mt_bid_f + mt_ask_f) / 2.0
+
+    if tl_reference <= 0 or mt_reference <= 0:
+        result["translation_status"] = "invalid_reference_midpoint"
+        return result
+
+    reference_ratio = mt_reference / tl_reference
+
+    translated_plan: dict[str, Any] = {
+        "instrument": match_trader_cross_reference.get(
+            "match_trader_instrument"
+        ),
+        "alias": match_trader_cross_reference.get(
+            "match_trader_alias"
+        ),
+        "direction": frozen_trade_plan.get("direction"),
+        "order_type": frozen_trade_plan.get("order_type"),
+    }
+
+    level_fields = (
+        "entry",
+        "safe_loss",
+        "take_profit_1",
+        "take_profit_2",
+        "take_profit_3",
+    )
+
+    translated_count = 0
+
+    for field in level_fields:
+        value = frozen_trade_plan.get(field)
+
+        if value is None:
+            translated_plan[field] = None
+            continue
+
+        try:
+            tl_level = float(value)
+        except (TypeError, ValueError):
+            translated_plan[field] = None
+            continue
+
+        if tl_level <= 0:
+            translated_plan[field] = None
+            continue
+
+        # Preserve the level's proportional displacement from the
+        # current TradeLocker reference on the Match-Trader feed.
+        translated_plan[field] = mt_reference * (
+            tl_level / tl_reference
+        )
+        translated_count += 1
+
+    if translated_count == 0:
+        result["translation_status"] = (
+            "no_translatable_trade_plan_levels"
+        )
+        return result
+
+    result.update(
+        {
+            "available": True,
+            "translation_status": "translated",
+            "tradelocker_reference_price": tl_reference,
+            "match_trader_reference_price": mt_reference,
+            "reference_ratio": reference_ratio,
+            "translated_trade_plan": translated_plan,
+        }
+    )
+
+    return result
+
+
+@router.get("/scan/{nickname}/export-ai")
+async def export_ai_scan(
+    nickname: str,
+    symbols: list[str] | None = Query(default=None),
+) -> Response:
+    """Generate one structured JSON package for external AI review."""
+
+    _timing_started = time.perf_counter()
+    _timing_stage_started = _timing_started
+    _timings_ms: dict[str, float] = {}
+
+    def _finish_stage(name: str) -> None:
+        nonlocal _timing_stage_started
+        _timings_ms[name] = round((time.perf_counter() - _timing_stage_started) * 1000, 3)
+        _timing_stage_started = time.perf_counter()
+
+    manager = AccountManager()
+    account = manager.get_account(nickname)
+
+    if account is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Account {nickname!r} not found.",
+        )
+
+    if not account.external_account_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Account has no external account ID.",
+        )
+
+    if not account.external_account_number:
+        raise HTTPException(
+            status_code=400,
+            detail="Account has no external account number.",
+        )
+
+    # -------------------------------------------------
+    # Full-market discovery.
+    #
+    # Explicit symbol requests remain authoritative.
+    # Otherwise:
+    #   broker universe
+    #       -> lightweight live quote discovery
+    #       -> diversified liquidity shortlist
+    #       -> existing deep multi-timeframe scan
+    #
+    # Discovery itself never authorizes or executes trades.
+    # -------------------------------------------------
+    shared_connector = TradeLockerConnector()
+    shared_instrument_metadata = None
+    shared_instrument_metadata_error = None
+
+    try:
+        shared_instrument_metadata = (
+            await shared_connector.get_available_instruments(
+                account_id=int(account.external_account_id),
+                acc_num=str(account.external_account_number),
+            )
+        )
+    except Exception as error:
+        shared_instrument_metadata_error = (
+            f"{type(error).__name__}: {error}"
+        )
+
+    _finish_stage("stage_1_account_and_connector")
+
+    market_discovery = {
+        "mode": (
+            "explicit_symbols"
+            if symbols
+            else "full_market_live_quote_discovery"
+        ),
+        "selection_is_advisory": True,
+        "contains_trade_authorization": False,
+        "universe_asset_classes": [
+            "forex",
+            "index",
+            "commodity",
+            "crypto",
+        ],
+        "broker_instrument_count": None,
+        "eligible_instrument_count": 0,
+        "live_quote_success_count": 0,
+        "live_quote_failure_count": 0,
+        "selected_symbols": [],
+        "selected_count": 0,
+        "selection_method": None,
+        "candidates": [],
+        "error": None,
+    }
+
+    if symbols:
+        requested_symbols = list(symbols)
+        market_discovery["selected_symbols"] = (
+            list(requested_symbols)
+        )
+        market_discovery["selected_count"] = len(
+            requested_symbols
+        )
+        market_discovery["selection_method"] = (
+            "explicit_user_or_client_symbol_request"
+        )
+
+    else:
+        try:
+            if shared_instrument_metadata is None:
+                raise ValueError(
+                    shared_instrument_metadata_error
+                    or "TradeLocker instrument metadata unavailable."
+                )
+
+            from app.services.tradelocker_resolver import (
+                _collect_instruments,
+                _symbol_values,
+            )
+            import asyncio as _asyncio
+
+            broker_items = _collect_instruments(
+                shared_instrument_metadata
+            )
+            market_discovery["broker_instrument_count"] = len(
+                broker_items
+            )
+
+            _fx_codes = {
+                "USD", "EUR", "GBP", "JPY", "CHF",
+                "CAD", "AUD", "NZD", "SEK", "NOK",
+                "DKK", "SGD", "HKD", "ZAR", "MXN",
+                "PLN", "TRY", "CNH",
+            }
+
+            _crypto_tokens = {
+                "BTC", "ETH", "SOL", "XRP", "LTC",
+                "ADA", "DOGE", "DOT", "AVAX", "LINK",
+                "BCH", "ETC", "XLM", "UNI", "AAVE",
+                "TRX",
+            }
+
+            _index_fragments = (
+                "NAS100", "US100", "USTEC", "NASDAQ",
+                "US30", "DJ30", "DOW",
+                "SPX500", "SP500", "US500",
+                "GER40", "DE40", "DAX",
+                "UK100", "FTSE",
+                "FRA40", "CAC",
+                "JPN225", "JP225", "NIKKEI",
+                "AUS200", "AU200",
+                "HK50", "EU50",
+            )
+
+            _commodity_fragments = (
+                "XAU", "XAG", "XPT", "XPD",
+                "USOIL", "UKOIL", "WTI",
+                "BRENT", "OIL",
+                "NGAS", "NATGAS", "COPPER",
+            )
+
+            def _discovery_category(item, symbol):
+                upper = str(symbol or "").upper()
+                compact = (
+                    upper.replace("/", "")
+                    .replace("-", "")
+                    .replace("_", "")
+                    .split(".", 1)[0]
+                )
+
+                type_text = " ".join(
+                    str(item.get(key) or "").upper()
+                    for key in (
+                        "type",
+                        "instrumentType",
+                        "assetClass",
+                        "category",
+                    )
+                )
+
+                if (
+                    "CRYPTO" in type_text
+                    or any(
+                        compact.startswith(token)
+                        for token in _crypto_tokens
+                    )
+                ):
+                    return "crypto"
+
+                if (
+                    "INDEX" in type_text
+                    or any(
+                        fragment in compact
+                        for fragment in _index_fragments
+                    )
+                ):
+                    return "index"
+
+                if (
+                    "COMMOD" in type_text
+                    or "METAL" in type_text
+                    or any(
+                        fragment in compact
+                        for fragment in _commodity_fragments
+                    )
+                ):
+                    return "commodity"
+
+                if len(compact) >= 6:
+                    base = compact[:3]
+                    quote = compact[3:6]
+                    if (
+                        base in _fx_codes
+                        and quote in _fx_codes
+                    ):
+                        return "forex"
+
+                if "FOREX" in type_text or " FX " in (
+                    " " + type_text + " "
+                ):
+                    return "forex"
+
+                return None
+
+            eligible = []
+            seen_symbols = set()
+
+            for item in broker_items:
+                names = _symbol_values(item)
+                if not names:
+                    continue
+
+                raw_symbol = (
+                    item.get("symbol")
+                    or item.get("name")
+                    or item.get("localizedName")
+                    or names[0]
+                )
+
+                symbol_name = str(raw_symbol).strip().upper()
+
+                if (
+                    not symbol_name
+                    or symbol_name in seen_symbols
+                ):
+                    continue
+
+                category = _discovery_category(
+                    item,
+                    symbol_name,
+                )
+
+                if category is None:
+                    continue
+
+                if weekend_crypto_only() and category != "crypto":
+                    continue
+
+                seen_symbols.add(symbol_name)
+                eligible.append(
+                    {
+                        "symbol": symbol_name,
+                        "category": category,
+                    }
+                )
+
+            market_discovery["eligible_instrument_count"] = len(
+                eligible
+            )
+
+            _quote_semaphore = _asyncio.Semaphore(6)
+
+            async def _discover_quote(candidate):
+                symbol_name = candidate["symbol"]
+                category = candidate["category"]
+
+                async with _quote_semaphore:
+                    try:
+                        resolved = resolve_tradelocker_instrument(
+                            shared_instrument_metadata,
+                            symbol_name,
+                        )
+
+                        if resolved.info_route_id is None:
+                            raise ValueError(
+                                "No INFO route for live quotes."
+                            )
+
+                        cache_key = (
+                            f"{account.external_account_id}:"
+                            f"{resolved.tradable_instrument_id}:"
+                            f"{resolved.info_route_id}"
+                        )
+
+                        cached = get_cached(
+                            "quote",
+                            cache_key,
+                            ttl_seconds=10,
+                        )
+
+                        if cached is not None:
+                            raw_quote = cached["value"]
+                            quote_source = "cache"
+                            quote_age_seconds = cached[
+                                "age_seconds"
+                            ]
+                        else:
+                            raw_quote = await _export_retry(
+                                shared_connector.get_quotes,
+                                tradable_instrument_id=(
+                                    resolved.tradable_instrument_id
+                                ),
+                                route_id=resolved.info_route_id,
+                                acc_num=str(
+                                    account.external_account_number
+                                ),
+                            )
+                            set_cached(
+                                "quote",
+                                cache_key,
+                                raw_quote,
+                            )
+                            quote_source = "live"
+                            quote_age_seconds = 0
+
+                        quote_data = (
+                            raw_quote.get("d")
+                            if isinstance(raw_quote, dict)
+                            else None
+                        )
+
+                        if not isinstance(quote_data, dict):
+                            raise ValueError(
+                                "Invalid live quote payload."
+                            )
+
+                        ask = quote_data.get("ap")
+                        bid = quote_data.get("bp")
+
+                        if ask is None or bid is None:
+                            raise ValueError(
+                                "Live bid/ask unavailable."
+                            )
+
+                        ask = float(ask)
+                        bid = float(bid)
+
+                        if ask <= 0 or bid <= 0 or ask < bid:
+                            raise ValueError(
+                                "Live bid/ask values are invalid."
+                            )
+
+                        mid = (ask + bid) / 2.0
+                        spread = ask - bid
+                        relative_spread_bps = (
+                            (spread / mid) * 10000.0
+                            if mid > 0
+                            else float("inf")
+                        )
+
+                        return {
+                            "symbol": symbol_name,
+                            "category": category,
+                            "tradable_instrument_id": (
+                                resolved.tradable_instrument_id
+                            ),
+                            "info_route_id": (
+                                resolved.info_route_id
+                            ),
+                            "live_bid": bid,
+                            "live_ask": ask,
+                            "live_mid": mid,
+                            "spread": spread,
+                            "relative_spread_bps": (
+                                relative_spread_bps
+                            ),
+                            "quote_source": quote_source,
+                            "quote_age_seconds": (
+                                quote_age_seconds
+                            ),
+                            "quote_available": True,
+                        }
+
+                    except Exception as error:
+                        return {
+                            "symbol": symbol_name,
+                            "category": category,
+                            "quote_available": False,
+                            "error": (
+                                f"{type(error).__name__}: {error}"
+                            ),
+                        }
+
+            discovery_results = await _asyncio.gather(
+                *[
+                    _discover_quote(candidate)
+                    for candidate in eligible
+                ]
+            )
+
+            quoted = [
+                item
+                for item in discovery_results
+                if item.get("quote_available") is True
+            ]
+
+            failed = [
+                item
+                for item in discovery_results
+                if item.get("quote_available") is not True
+            ]
+
+            market_discovery["live_quote_success_count"] = len(
+                quoted
+            )
+            market_discovery["live_quote_failure_count"] = len(
+                failed
+            )
+
+            quoted.sort(
+                key=lambda item: (
+                    float(
+                        item.get(
+                            "relative_spread_bps",
+                            float("inf"),
+                        )
+                    ),
+                    item["symbol"],
+                )
+            )
+
+            # Keep the shortlist cross-asset rather than allowing
+            # the lowest-spread FX pairs to crowd out indices,
+            # oil/metals, and crypto before structural analysis.
+            if weekend_crypto_only():
+                quotas = {"crypto": 10}
+            else:
+                quotas = {
+                    "forex": 4,
+                    "index": 2,
+                    "commodity": 2,
+                    "crypto": 2,
+                }
+
+            # Atlas discovery priority:
+            # broad broker discovery still happens first, but the deep-scan
+            # shortlist favors liquid, decision-useful markets before exotic
+            # instruments. Relative spread remains the secondary rank signal.
+            _atlas_market_priority = [
+                "EURUSD",
+                "GBPUSD",
+                "USDJPY",
+                "AUDUSD",
+                "USDCAD",
+                "USDCHF",
+                "NZDUSD",
+                "EURJPY",
+                "GBPJPY",
+                "EURGBP",
+                "NAS100",
+                "US30",
+                "US500",
+                "SPX500",
+                "GER40",
+                "UK100",
+                "XAUUSD",
+                "XAGUSD",
+                "USOIL",
+                "UKOIL",
+                "BTCUSD",
+                "ETHUSD",
+                "SOLUSD",
+                "BNBUSD",
+                "XRPUSD",
+            ]
+            
+            _atlas_priority_index = {
+                name: rank
+                for rank, name in enumerate(_atlas_market_priority)
+            }
+            
+            def _normalized_discovery_symbol(value):
+                return "".join(
+                    ch
+                    for ch in str(value or "").upper()
+                    if ch.isalnum()
+                )
+            
+            def _priority_rank(item):
+                symbol_name = _normalized_discovery_symbol(
+                    item.get("symbol")
+                )
+            
+                preferred_rank = len(_atlas_market_priority) + 100
+            
+                for preferred, rank in _atlas_priority_index.items():
+                    if (
+                        symbol_name == preferred
+                        or symbol_name.startswith(preferred)
+                    ):
+                        preferred_rank = rank
+                        break
+            
+                spread_rank = item.get("relative_spread_bps")
+                if spread_rank is None:
+                    spread_rank = float("inf")
+            
+                return (
+                    preferred_rank,
+                    float(spread_rank),
+                    symbol_name,
+                )
+            
+            ranked_quoted = sorted(
+                quoted,
+                key=_priority_rank,
+            )
+            
+            def _discovery_market_family(value):
+                normalized = _normalized_discovery_symbol(value)
+            
+                for preferred in _atlas_market_priority:
+                    if (
+                        normalized == preferred
+                        or normalized.startswith(preferred)
+                    ):
+                        return preferred
+            
+                return normalized
+            
+            
+            # Collapse broker variants before quota selection.
+            # Example:
+            # NAS100.MINI + NAS100 -> NAS100
+            # XAUUSD.PRO + XAUUSD -> XAUUSD
+            #
+            # If the canonical broker symbol exists, prefer it.
+            _family_best = {}
+            _family_order = []
+            
+            for item in ranked_quoted:
+                family = _discovery_market_family(
+                    item.get("symbol")
+                )
+            
+                current = _family_best.get(family)
+            
+                if current is None:
+                    _family_best[family] = item
+                    _family_order.append(family)
+                    continue
+            
+                candidate_symbol = _normalized_discovery_symbol(
+                    item.get("symbol")
+                )
+                current_symbol = _normalized_discovery_symbol(
+                    current.get("symbol")
+                )
+            
+                candidate_is_canonical = (
+                    candidate_symbol == family
+                )
+                current_is_canonical = (
+                    current_symbol == family
+                )
+            
+                if (
+                    candidate_is_canonical
+                    and not current_is_canonical
+                ):
+                    _family_best[family] = item
+            
+            ranked_quoted = [
+                _family_best[family]
+                for family in _family_order
+            ]
+            
+            selected = []
+            selected_names = set()
+            
+            for category, quota in quotas.items():
+                category_items = [
+                    item
+                    for item in ranked_quoted
+                    if item["category"] == category
+                ]
+            
+                for item in category_items[:quota]:
+                    if item["symbol"] in selected_names:
+                        continue
+            
+                    selected.append(item)
+                    selected_names.add(item["symbol"])
+            
+            # Fill unused quota slots with the next highest-priority,
+            # live-quoted instrument regardless of asset class.
+            for item in ranked_quoted:
+                if len(selected) >= 10:
+                    break
+            
+                if item["symbol"] in selected_names:
+                    continue
+            
+                selected.append(item)
+                selected_names.add(item["symbol"])
+            if not selected:
+                raise ValueError(
+                    "No live-quoted instruments survived discovery."
+                )
+
+            requested_symbols = [
+                item["symbol"]
+                for item in selected[:10]
+            ]
+
+            market_discovery["selected_symbols"] = list(
+                requested_symbols
+            )
+            market_discovery["selected_count"] = len(
+                requested_symbols
+            )
+            market_discovery["selection_method"] = (
+                "atlas_priority_then_relative_spread_prefilter_then_"
+                "existing_deep_multitimeframe_analysis"
+            )
+            market_discovery["candidates"] = selected[:10]
+
+        except Exception as error:
+            requested_symbols = default_tradable_symbols(
+                DEFAULT_SYMBOLS
+            )
+            market_discovery["error"] = (
+                f"{type(error).__name__}: {error}"
+            )
+            market_discovery["selected_symbols"] = list(
+                requested_symbols
+            )
+            market_discovery["selected_count"] = len(
+                requested_symbols
+            )
+            market_discovery["selection_method"] = (
+                "safe_existing_default_fallback_after_"
+                "discovery_failure"
+            )
+    # Capture Atlas state early because later export enrichment
+    # blocks depend on these values.
+    bootstrap_snapshot = await bootstrap_status()
+    monitor_snapshot = await monitor_status()
+
+    latest_result = monitor_snapshot.get("latest_result")
+    frozen_trade_plan = monitor_snapshot.get("frozen_trade_plan")
+
+    frozen_instrument = (
+        frozen_trade_plan.get("instrument")
+        if isinstance(frozen_trade_plan, dict)
+        else None
+    )
+
+    match_trader_cross_reference = await _match_trader_cross_reference(
+        frozen_instrument
+    )
+
+    if not requested_symbols:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one symbol is required.",
+        )
+
+    if len(requested_symbols) > 10:
+        raise HTTPException(
+            status_code=400,
+            detail="AI Scan Export may contain no more than 10 symbols.",
+        )
+
+    _finish_stage("stage_2_market_discovery")
+
+    scanner = ScannerService()
+
+    batch = await scanner.scan_symbols(
+        symbols=requested_symbols,
+        account_id=int(account.external_account_id),
+        broker_crypto_only=(
+            symbols is None and weekend_crypto_only()
+        ),
+        acc_num=str(account.external_account_number),
+        history_request_delay_seconds=2.0,
+    )
+
+    exported_instruments = []
+
+    # Persistent read-only alerts.
+    active_alert_snapshot = active_alerts()
+    alert_evaluations: list[dict[str, Any]] = []
+    triggered_alerts: list[dict[str, Any]] = []
+    quotes_available_count = 0
+
+    for symbol in requested_symbols:
+        scan = batch["results"].get(symbol)
+
+        if not scan:
+            continue
+
+        _finish_stage("stage_3_scanner")
+
+        analysis = analyze_scan(scan)
+
+        timeframe_export: dict[str, Any] = {}
+
+        for timeframe in TIMEFRAMES:
+            raw_payload = scan.get("timeframes", {}).get(timeframe, {})
+            candles = _normalize_candles(raw_payload)
+
+            analysis_tf = (
+                analysis.get("timeframes", {}).get(timeframe, {})
+                if isinstance(analysis, dict)
+                else {}
+            )
+
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            duration_seconds = TIMEFRAME_SECONDS.get(timeframe)
+            duration_ms = (
+                duration_seconds * 1000
+                if duration_seconds is not None
+                else None
+            )
+
+            latest_timestamp = None
+            expected_close_ms = None
+            seconds_remaining = None
+            data_age_seconds = None
+            candle_status = "UNKNOWN"
+            stale = None
+            incomplete = len(candles) == 0
+
+            if candles:
+                raw_timestamp = candles[-1].get("timestamp")
+
+                try:
+                    latest_timestamp = int(raw_timestamp)
+                except (TypeError, ValueError):
+                    latest_timestamp = None
+
+            if (
+                latest_timestamp is not None
+                and duration_ms is not None
+            ):
+                expected_close_ms = (
+                    latest_timestamp + duration_ms
+                )
+
+                data_age_seconds = max(
+                    0,
+                    int((now_ms - latest_timestamp) / 1000),
+                )
+
+                if now_ms < expected_close_ms:
+                    candle_status = "OPEN"
+                    seconds_remaining = max(
+                        0,
+                        int((expected_close_ms - now_ms) / 1000),
+                    )
+                else:
+                    candle_status = "CLOSED"
+                    seconds_remaining = 0
+
+                # Treat data as stale only when it is more than
+                # two full timeframe durations old.
+                stale = (
+                    data_age_seconds
+                    > (duration_seconds * 2)
+                )
+
+            timeframe_export[timeframe] = {
+                "candle_count": len(candles),
+                "candles": candles,
+                "rsi_14": analysis_tf.get("rsi_14"),
+                "momentum": analysis_tf.get("momentum"),
+                "structure": analysis_tf.get("structure"),
+                "last_price": analysis_tf.get("last_price"),
+
+                "candle_status": {
+                    "status": candle_status,
+                    "latest_timestamp_ms": latest_timestamp,
+                    "latest_timestamp_utc": (
+                        datetime.fromtimestamp(
+                            latest_timestamp / 1000,
+                            tz=timezone.utc,
+                        ).isoformat()
+                        if latest_timestamp is not None
+                        else None
+                    ),
+                    "expected_close_timestamp_ms": expected_close_ms,
+                    "expected_close_utc": (
+                        datetime.fromtimestamp(
+                            expected_close_ms / 1000,
+                            tz=timezone.utc,
+                        ).isoformat()
+                        if expected_close_ms is not None
+                        else None
+                    ),
+                    "seconds_remaining": seconds_remaining,
+                    "data_age_seconds": data_age_seconds,
+                    "stale": stale,
+                    "incomplete": incomplete,
+                    "timeframe_seconds": duration_seconds,
+                },
+            }
+
+        timeframe_validation_errors = _validate_timeframe_integrity(
+            timeframe_export
+        )
+
+        if timeframe_validation_errors:
+            # Explicit symbol exports remain strict: if the caller
+            # specifically requested this instrument, refuse the export.
+            #
+            # Full-market discovery is different. One broker instrument
+            # with stale/bad candles must not invalidate every other
+            # discovered market. Exclude that instrument, preserve the
+            # exact integrity failure in the discovery audit, and continue
+            # with the remaining structurally valid instruments.
+            if symbols is None:
+                market_discovery.setdefault(
+                    "timeframe_integrity_rejections",
+                    [],
+                ).append(
+                    {
+                        "symbol": symbol,
+                        "validation_errors": list(
+                            timeframe_validation_errors
+                        ),
+                        "excluded_from_deep_analysis": True,
+                        "reason": (
+                            "Discovered instrument failed strict "
+                            "timeframe integrity validation."
+                        ),
+                    }
+                )
+                market_discovery[
+                    "timeframe_integrity_rejection_count"
+                ] = len(
+                    market_discovery[
+                        "timeframe_integrity_rejections"
+                    ]
+                )
+                continue
+
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "timeframe_integrity_validation_failed",
+                    "symbol": symbol,
+                    "validation_errors": timeframe_validation_errors,
+                    "message": (
+                        "AI Scan Export refused because timeframe candle "
+                        "data failed integrity validation."
+                    ),
+                },
+            )
+
+        five_minute = timeframe_export.get("5M", {})
+        current_price = five_minute.get("last_price")
+
+        # --------------------------------------------------
+        # Live TradeLocker quote.
+        #
+        # ap = ask price
+        # bp = bid price
+        # as = ask size
+        # bs = bid size
+        #
+        # TradeLocker does not provide a quote timestamp in
+        # the current response, so broker timestamp/age remain
+        # null rather than being inferred.
+        # --------------------------------------------------
+
+        quote_snapshot = {
+            "available": False,
+            "bid": None,
+            "ask": None,
+            "spread": None,
+            "bid_size": None,
+            "ask_size": None,
+            "quote_timestamp": None,
+            "quote_age_seconds": None,
+            "broker_staleness_known": False,
+            "atlas_received_at": None,
+            "raw_quote": None,
+            "cache": None,
+            "error": None,
+        }
+
+        try:
+            quote_connector = shared_connector
+
+            if shared_instrument_metadata is None:
+                raise ValueError(
+                    shared_instrument_metadata_error
+                    or "Shared instrument metadata is unavailable."
+                )
+
+            quote_resolved = resolve_tradelocker_instrument(
+                shared_instrument_metadata,
+                symbol,
+            )
+
+            if quote_resolved.info_route_id is None:
+                raise ValueError(
+                    f"{symbol} has no INFO route for live quotes."
+                )
+
+            quote_cache_key = (
+                f"{account.external_account_id}:"
+                f"{quote_resolved.tradable_instrument_id}:"
+                f"{quote_resolved.info_route_id}"
+            )
+
+            quote_cache_meta = None
+
+            cached_quote = get_cached(
+                "quote",
+                quote_cache_key,
+                ttl_seconds=10,
+            )
+
+            if cached_quote is not None:
+                raw_quote = cached_quote["value"]
+
+                quote_cache_meta = {
+                    "source": "cache",
+                    "captured_at": cached_quote["captured_at"],
+                    "age_seconds": cached_quote["age_seconds"],
+                    "stale": False,
+                }
+
+            else:
+                try:
+                    raw_quote = await _export_retry(
+                        quote_connector.get_quotes,
+                        tradable_instrument_id=(
+                            quote_resolved.tradable_instrument_id
+                        ),
+                        route_id=quote_resolved.info_route_id,
+                        acc_num=str(account.external_account_number),
+                    )
+
+                    set_cached(
+                        "quote",
+                        quote_cache_key,
+                        raw_quote,
+                    )
+
+                    quote_cache_meta = {
+                        "source": "live",
+                        "captured_at": datetime.now(
+                            timezone.utc
+                        ).isoformat(),
+                        "age_seconds": 0,
+                        "stale": False,
+                    }
+
+                except Exception:
+                    stale_quote = get_cached_even_if_stale(
+                        "quote",
+                        quote_cache_key,
+                    )
+
+                    if stale_quote is None:
+                        raise
+
+                    raw_quote = stale_quote["value"]
+
+                    quote_cache_meta = {
+                        "source": "stale_cache",
+                        "captured_at": stale_quote["captured_at"],
+                        "age_seconds": stale_quote["age_seconds"],
+                        "stale": True,
+                    }
+
+            quote_data = (
+                raw_quote.get("d")
+                if isinstance(raw_quote, dict)
+                else None
+            )
+
+            if not isinstance(quote_data, dict):
+                raise ValueError(
+                    "TradeLocker live quote payload is invalid."
+                )
+
+            ask = quote_data.get("ap")
+            bid = quote_data.get("bp")
+
+            ask_float = (
+                float(ask)
+                if ask is not None
+                else None
+            )
+
+            bid_float = (
+                float(bid)
+                if bid is not None
+                else None
+            )
+
+            spread = (
+                ask_float - bid_float
+                if ask_float is not None
+                and bid_float is not None
+                else None
+            )
+
+            received_at = datetime.now(timezone.utc)
+
+            quote_snapshot.update(
+                {
+                    "available": (
+                        ask_float is not None
+                        and bid_float is not None
+                    ),
+                    "bid": bid_float,
+                    "ask": ask_float,
+                    "spread": spread,
+                    "bid_size": quote_data.get("bs"),
+                    "ask_size": quote_data.get("as"),
+                    "atlas_received_at": received_at.isoformat(),
+                    "raw_quote": raw_quote,
+                    "cache": quote_cache_meta,
+                }
+            )
+
+            if quote_snapshot["available"]:
+                quotes_available_count += 1
+
+        except Exception as error:
+            quote_snapshot["error"] = (
+                f"{type(error).__name__}: {error}"
+            )
+
+        # ----------------------------------------------
+        # Evaluate persistent alerts using the fresh TradeLocker
+        # bid/ask midpoint. Stale cached quotes cannot trigger alerts.
+        # This makes no additional broker quote request.
+        # ----------------------------------------------
+        alert_price = None
+        quote_cache = quote_snapshot.get("cache") or {}
+
+        if (
+            quote_snapshot.get("available")
+            and not bool(quote_cache.get("stale"))
+        ):
+            live_bid = quote_snapshot.get("bid")
+            live_ask = quote_snapshot.get("ask")
+
+            if live_bid is not None and live_ask is not None:
+                alert_price = (
+                    float(live_bid) + float(live_ask)
+                ) / 2.0
+
+        if alert_price is not None:
+            for stored_alert in active_alert_snapshot:
+                if (
+                    str(stored_alert.get("instrument", "")).upper()
+                    != str(symbol).upper()
+                ):
+                    continue
+
+                evaluated_alert = evaluate_alert(
+                    str(stored_alert.get("id")),
+                    current_price=float(alert_price),
+                )
+
+                if not isinstance(evaluated_alert, dict):
+                    continue
+
+                alert_evaluations.append(evaluated_alert)
+
+                if evaluated_alert.get("status") == "TRIGGERED":
+                    triggered_alerts.append(evaluated_alert)
+                    mark_alert_review_required(
+                        instrument=str(symbol),
+                        alert=evaluated_alert,
+                    )
+
+        # Normalize trade geometry before export.
+        # Structural invalidation is authoritative. The Bridge does not
+        # invent an additional stop buffer unless Atlas defines one later.
+        if isinstance(analysis, dict):
+            _geometry = analysis.get("geometry")
+            _plan = analysis.get("trade_plan")
+            _bias = analysis.get("directional_bias")
+
+            if isinstance(_geometry, dict) and isinstance(_plan, dict):
+                _entry = _plan.get("entry_reference")
+                _invalidation = _geometry.get("invalidation")
+
+                if (
+                    isinstance(_entry, (int, float))
+                    and isinstance(_invalidation, (int, float))
+                    and _entry != _invalidation
+                ):
+                    _risk_distance = abs(_entry - _invalidation)
+
+                    _plan["structure_invalidation"] = _invalidation
+                    _plan["stop_buffer"] = 0.0
+                    _plan["stop_buffer_basis"] = (
+                        "No synthetic buffer applied. Structural invalidation "
+                        "is the authoritative Bridge stop until Atlas defines "
+                        "an explicit buffer rule."
+                    )
+                    _plan["final_safe_loss"] = _invalidation
+                    _plan["safe_loss"] = _invalidation
+                    _plan["risk_distance"] = _risk_distance
+                    _plan["geometry_policy"] = (
+                        "structural_invalidation_no_synthetic_buffer"
+                    )
+
+                    # Remove manufactured duplicate targets.
+                    _tp1 = _plan.get("tp1")
+                    _tp2 = _plan.get("tp2")
+                    _tp3 = _plan.get("tp3")
+
+                    if _tp2 == _tp1:
+                        _plan["tp2"] = None
+                        _tp2 = None
+
+                    if _tp3 == _tp1 or (_tp2 is not None and _tp3 == _tp2):
+                        _plan["tp3"] = None
+                        _tp3 = None
+
+                    _distinct_targets = [
+                        value
+                        for value in (
+                            _plan.get("tp1"),
+                            _plan.get("tp2"),
+                            _plan.get("tp3"),
+                        )
+                        if isinstance(value, (int, float))
+                    ]
+                    _plan["distinct_targets"] = _distinct_targets
+                    _plan["target_count"] = len(_distinct_targets)
+
+                    # Recalculate target rewards and RR from structural stop.
+                    for _target_name in ("tp1", "tp2", "tp3"):
+                        _target = _plan.get(_target_name)
+                        _suffix = _target_name
+
+                        if not isinstance(_target, (int, float)):
+                            _plan[f"reward_to_{_suffix}"] = None
+                            _plan[f"rr_{_suffix}"] = None
+                            continue
+
+                        if _bias == "bullish":
+                            _reward = _target - _entry
+                        elif _bias == "bearish":
+                            _reward = _entry - _target
+                        else:
+                            _reward = abs(_target - _entry)
+
+                        if _reward <= 0:
+                            _plan[f"reward_to_{_suffix}"] = None
+                            _plan[f"rr_{_suffix}"] = None
+                        else:
+                            _plan[f"reward_to_{_suffix}"] = _reward
+                            _plan[f"rr_{_suffix}"] = round(
+                                _reward / _risk_distance,
+                                2,
+                            )
+        exported_instruments.append(
+            {
+                "symbol": symbol,
+                "broker": {
+                    "tradable_instrument_id": scan.get(
+                        "tradable_instrument_id"
+                    ),
+                    "route_id": scan.get("route_id"),
+                },
+                "market_snapshot": {
+                    "analysis_price": current_price,
+                    "analysis_price_source": "latest_5m_bar",
+                    "live_bid": quote_snapshot["bid"],
+                    "live_ask": quote_snapshot["ask"],
+                    "live_mid": (
+                        ((quote_snapshot["bid"]) + (quote_snapshot["ask"])) / 2
+                        if (quote_snapshot["bid"]) is not None and (quote_snapshot["ask"]) is not None
+                        else None
+                    ),
+                    "price_semantics": (
+                        "analysis_price is the latest 5M bar/reference price, not an executable quote. "
+                        "live_bid and live_ask are current TradeLocker quote values; live_mid is their midpoint. "
+                        "For market-entry evaluation use live_ask for LONG and live_bid for SHORT."
+                    ),
+                    "bid": quote_snapshot["bid"],
+                    "ask": quote_snapshot["ask"],
+                    "spread": quote_snapshot["spread"],
+                    "bid_size": quote_snapshot["bid_size"],
+                    "ask_size": quote_snapshot["ask_size"],
+                    "quote_timestamp": quote_snapshot["quote_timestamp"],
+                    "quote_age_seconds": quote_snapshot["quote_age_seconds"],
+                    "broker_staleness_known": (
+                        quote_snapshot["broker_staleness_known"]
+                    ),
+                    "atlas_received_at": (
+                        quote_snapshot["atlas_received_at"]
+                    ),
+                    "quotes_available": quote_snapshot["available"],
+                    "quote_note": (
+                        "Bid/ask values are live TradeLocker quote values. "
+                        "The broker response does not currently expose a "
+                        "quote timestamp, so broker quote age/staleness is "
+                        "left null rather than estimated."
+                    ),
+                    "raw_quote": quote_snapshot["raw_quote"],
+                    "quote_error": quote_snapshot["error"],
+                    "cache": quote_snapshot["cache"],
+                },
+                "timeframes": timeframe_export,
+                "bridge_analysis": analysis,
+            }
+        )
+
+    # --------------------------------------------------
+    # Live broker account/risk snapshot.
+    # Missing broker fields remain null rather than estimated.
+    # --------------------------------------------------
+
+    raw_account_state = None
+    account_state_error = None
+
+    try:
+        connector = TradeLockerConnector()
+
+        config = await connector.get_trade_config(
+            acc_num=str(account.external_account_number),
+        )
+
+        state = await connector.get_account_state(
+            account_id=int(account.external_account_id),
+            acc_num=str(account.external_account_number),
+        )
+
+        raw_account_state = map_tradelocker_account_state(
+            config,
+            state,
+        )
+
+    except Exception as error:
+        account_state_error = (
+            f"{type(error).__name__}: {error}"
+        )
+
+    def account_value(name: str):
+        if not isinstance(raw_account_state, dict):
+            return None
+        return raw_account_state.get(name)
+
+    # --------------------------------------------------
+    # Current broker exposure.
+    # Preserve TradeLocker records exactly as returned.
+    # A normalized field map will be added once a real
+    # non-empty broker response has been observed.
+    # --------------------------------------------------
+
+    exposure_error = None
+    open_positions = None
+    pending_orders = None
+    raw_positions_response = None
+    raw_orders_response = None
+
+    try:
+        exposure_connector = TradeLockerConnector()
+
+        raw_positions_response = (
+            await exposure_connector.get_open_positions(
+                account_id=int(account.external_account_id),
+                acc_num=str(account.external_account_number),
+            )
+        )
+
+        raw_orders_response = (
+            await exposure_connector.get_pending_orders(
+                account_id=int(account.external_account_id),
+                acc_num=str(account.external_account_number),
+            )
+        )
+
+        positions_data = (
+            raw_positions_response.get("d")
+            if isinstance(raw_positions_response, dict)
+            else None
+        )
+
+        orders_data = (
+            raw_orders_response.get("d")
+            if isinstance(raw_orders_response, dict)
+            else None
+        )
+
+        open_positions = (
+            positions_data.get("positions")
+            if isinstance(positions_data, dict)
+            else None
+        )
+
+        pending_orders = (
+            orders_data.get("orders")
+            if isinstance(orders_data, dict)
+            else None
+        )
+
+        if open_positions is None:
+            open_positions = []
+
+        if pending_orders is None:
+            pending_orders = []
+
+    except Exception as error:
+        exposure_error = (
+            f"{type(error).__name__}: {error}"
+        )
+
+    current_exposure = {
+        "available": (
+            open_positions is not None
+            and pending_orders is not None
+        ),
+        "open_position_count": (
+            len(open_positions)
+            if isinstance(open_positions, list)
+            else None
+        ),
+        "pending_order_count": (
+            len(pending_orders)
+            if isinstance(pending_orders, list)
+            else None
+        ),
+        "open_positions": open_positions,
+        "pending_orders": pending_orders,
+        "normalization_note": (
+            "Broker records are preserved verbatim. "
+            "Normalized symbol/direction/size/entry/SL/TP/P&L "
+            "fields will be added after a non-empty TradeLocker "
+            "response is observed."
+        ),
+        "raw_positions_response": raw_positions_response,
+        "raw_orders_response": raw_orders_response,
+        "error": exposure_error,
+    }
+
+    account_risk_snapshot = {
+        "available": raw_account_state is not None,
+
+        "balance": account_value("balance"),
+        "equity": None,
+        "free_margin": account_value("availableFunds"),
+        "used_margin": None,
+        "leverage": None,
+
+        "initial_margin_requirement": account_value(
+            "initialMarginReq"
+        ),
+        "maintenance_margin_requirement": account_value(
+            "maintMarginReq"
+        ),
+
+        "floating_gross_pl": account_value("openGrossPnL"),
+        "floating_net_pl": account_value("openNetPnL"),
+
+        "daily_gross_pl": account_value("todayGross"),
+        "daily_net_pl": account_value("todayNet"),
+        "daily_fees": account_value("todayFees"),
+        "daily_volume": account_value("todayVolume"),
+        "daily_trade_count": account_value("todayTradesCount"),
+
+        "positions_count": account_value("positionsCount"),
+        "orders_count": account_value("ordersCount"),
+
+        "margin_warning_level": account_value(
+            "marginWarningLevel"
+        ),
+        "stop_out_level": account_value("stopOutLevel"),
+
+        "maximum_permitted_risk_percent": MAX_RISK_PERCENT,
+
+        "unavailable_fields": [
+            "equity",
+            "used_margin",
+            "leverage",
+        ],
+
+        "raw_tradelocker_state": raw_account_state,
+        "error": account_state_error,
+    }
+
+    # --------------------------------------------------
+    # Broker / instrument specifications.
+    # Every exported instrument receives normalized
+    # TradeLocker specs when available, plus raw details.
+    # --------------------------------------------------
+
+    specs_available_count = 0
+
+    spec_live_fetch_budget = 1
+    spec_live_fetches = 0
+
+    specs_connector = shared_connector
+
+    for exported in exported_instruments:
+        symbol = (
+            exported.get("symbol")
+            or exported.get("instrument")
+        )
+
+        spec_block = {
+            "available": False,
+            "tradable_instrument_id": (
+                (exported.get("broker") or {}).get(
+                    "tradable_instrument_id"
+                )
+            ),
+            "route_id": (
+                (exported.get("broker") or {}).get("route_id")
+            ),
+            "minimum_lot": None,
+            "maximum_lot": None,
+            "lot_step": None,
+            "contract_size": None,
+            "tick_size": None,
+            "tick_value": None,
+            "tick_cost_raw": None,
+            "minimum_stop_distance": None,
+            "symbol_status": None,
+            "trading_session_id": None,
+            "trading_session_status_id": None,
+            "leverage": None,
+            "base_currency": None,
+            "quote_currency": None,
+            "bar_source": None,
+            "margin_hedging_type": None,
+            "raw_details": None,
+            "error": None,
+        }
+
+        try:
+            if shared_instrument_metadata is None:
+                raise ValueError(
+                    shared_instrument_metadata_error
+                    or "Shared instrument metadata is unavailable."
+                )
+
+            resolved = resolve_tradelocker_instrument(
+                shared_instrument_metadata,
+                str(symbol),
+            )
+
+            spec_cache_key = (
+                f"{account.external_account_id}:"
+                f"{resolved.tradable_instrument_id}:"
+                f"{resolved.route_id}"
+            )
+
+            spec_cache_meta = None
+
+            cached_specs = get_cached(
+                "instrument_specs",
+                spec_cache_key,
+                ttl_seconds=300,
+            )
+
+            if cached_specs is not None:
+                raw_details = cached_specs["value"]
+
+                spec_cache_meta = {
+                    "source": "cache",
+                    "captured_at": cached_specs["captured_at"],
+                    "age_seconds": cached_specs["age_seconds"],
+                    "stale": False,
+                }
+
+            else:
+                stale_specs = get_cached_even_if_stale(
+                    "instrument_specs",
+                    spec_cache_key,
+                )
+
+                if stale_specs is not None:
+                    raw_details = stale_specs["value"]
+
+                    spec_cache_meta = {
+                        "source": "stale_cache",
+                        "captured_at": stale_specs["captured_at"],
+                        "age_seconds": stale_specs["age_seconds"],
+                        "stale": True,
+                    }
+
+                elif spec_live_fetches >= spec_live_fetch_budget:
+                    raise RuntimeError(
+                        "Instrument spec refresh deferred: "
+                        "one-live-request budget exhausted."
+                    )
+
+                else:
+                    spec_live_fetches += 1
+
+                    raw_details = await _export_retry(
+                        specs_connector.get_instrument_details,
+                        tradable_instrument_id=(
+                            resolved.tradable_instrument_id
+                        ),
+                        route_id=resolved.route_id,
+                        acc_num=str(account.external_account_number),
+                    )
+
+                    set_cached(
+                        "instrument_specs",
+                        spec_cache_key,
+                        raw_details,
+                    )
+
+                    spec_cache_meta = {
+                        "source": "live",
+                        "captured_at": datetime.now(
+                            timezone.utc
+                        ).isoformat(),
+                        "age_seconds": 0,
+                        "stale": False,
+                    }
+
+            details = _instrument_details_payload(raw_details)
+
+            if details is None:
+                raise ValueError(
+                    "TradeLocker instrument details payload was invalid."
+                )
+
+            tick_size_data = details.get("tickSize")
+            tick_cost_data = details.get("tickCost")
+
+            tick_size = None
+            tick_cost = None
+
+            if (
+                isinstance(tick_size_data, list)
+                and tick_size_data
+                and isinstance(tick_size_data[0], dict)
+            ):
+                tick_size = tick_size_data[0].get("tickSize")
+
+            if (
+                isinstance(tick_cost_data, list)
+                and tick_cost_data
+                and isinstance(tick_cost_data[0], dict)
+            ):
+                tick_cost = tick_cost_data[0].get("tickCost")
+
+            spec_block.update(
+                {
+                    "available": True,
+                    "tradable_instrument_id": (
+                        resolved.tradable_instrument_id
+                    ),
+                    "route_id": resolved.route_id,
+                    "minimum_lot": details.get("minLot"),
+                    "maximum_lot": details.get("maxLot"),
+                    "lot_step": details.get("lotStep"),
+                    "contract_size": details.get("lotSize"),
+                    "tick_size": tick_size,
+                    # Do not infer tick value from a zero tickCost.
+                    "tick_value": (
+                        tick_cost
+                        if tick_cost not in (None, 0, 0.0)
+                        else None
+                    ),
+                    "tick_cost_raw": tick_cost,
+                    "minimum_stop_distance": details.get(
+                        "minStopDistance"
+                    ),
+                    "symbol_status": details.get("symbolStatus"),
+                    "trading_session_id": details.get(
+                        "tradeSessionId"
+                    ),
+                    "trading_session_status_id": details.get(
+                        "tradeSessionStatusId"
+                    ),
+                    "leverage": details.get("leverage"),
+                    "base_currency": details.get("baseCurrency"),
+                    "quote_currency": details.get(
+                        "quotingCurrency"
+                    ),
+                    "bar_source": details.get("barSource"),
+                    "margin_hedging_type": details.get(
+                        "margin_hedging_type"
+                    ),
+                    "raw_details": raw_details,
+                    "cache": spec_cache_meta,
+                }
+            )
+
+            specs_available_count += 1
+
+        except Exception as error:
+            spec_block["error"] = (
+                f"{type(error).__name__}: {error}"
+            )
+
+        exported["instrument_specs"] = spec_block
+
+    # --------------------------------------------------
+    # Structured WATCH / alert advisory metadata.
+    # Preserve the original alert objects and add a
+    # normalized trigger interpretation for external AI.
+    # --------------------------------------------------
+
+    enriched_alerts = []
+
+    latest_workflow = (
+        monitor_snapshot.get("latest_result")
+        if isinstance(monitor_snapshot, dict)
+        else None
+    )
+
+    source_alerts = (
+        latest_workflow.get("alerts", [])
+        if isinstance(latest_workflow, dict)
+        else []
+    )
+
+    source_watchlist = (
+        latest_workflow.get("watchlist", [])
+        if isinstance(latest_workflow, dict)
+        else []
+    )
+
+    for alert in source_alerts:
+        if not isinstance(alert, dict):
+            continue
+
+        alert_type = alert.get("alert_type")
+        bias = alert.get("bias")
+
+        trigger_direction = None
+        timeframe = None
+        condition_needed = None
+
+        if alert_type == "momentum_reconvergence":
+            timeframe = "5M"
+
+            if bias == "bullish":
+                trigger_direction = "ABOVE"
+                condition_needed = (
+                    "Price must reclaim/break above the 5M trigger "
+                    "for momentum reconvergence reassessment."
+                )
+            elif bias == "bearish":
+                trigger_direction = "BELOW"
+                condition_needed = (
+                    "Price must break below the 5M trigger "
+                    "for momentum reconvergence reassessment."
+                )
+
+        elif alert_type == "resistance_break":
+            timeframe = "15M"
+            trigger_direction = "ABOVE"
+            condition_needed = (
+                "Price must break above the 15M resistance trigger "
+                "for structural reassessment."
+            )
+
+        elif alert_type == "support_break":
+            timeframe = "15M"
+            trigger_direction = "BELOW"
+            condition_needed = (
+                "Price must break below the 15M support trigger "
+                "for structural reassessment."
+            )
+
+        enriched_alerts.append(
+            {
+                "instrument": alert.get("instrument"),
+                "trigger_price": alert.get("alert_level"),
+                "direction": trigger_direction,
+                "timeframe": timeframe,
+                "condition_needed": condition_needed,
+                "alert_type": alert_type,
+                "grade": alert.get("grade"),
+                "state": alert.get("state"),
+                "bias": bias,
+                "invalidation_or_cancel_level": None,
+                "expiry": None,
+                "human_readable_reason": alert.get("meaning"),
+                "source_alert": alert,
+            }
+        )
+
+    watch_advisory = {
+        "alerts": enriched_alerts,
+        "watchlist": source_watchlist,
+        "notes": {
+            "cancel_level_policy": (
+                "Null unless the Bridge has an explicit strategy-derived "
+                "invalidation level for the alert."
+            ),
+            "expiry_policy": (
+                "Null unless the strategy explicitly provides an expiry."
+            ),
+        },
+    }
+
+    # --------------------------------------------------
+    # Advisory risk-sized execution candidate.
+    # This is context only and grants NO execution permission.
+    # --------------------------------------------------
+
+    risk_sized_candidate = {
+        "available": False,
+        "advisory_only": True,
+        "execution_authorized": False,
+        "instrument": None,
+        "direction": None,
+        "proposed_risk_percent": None,
+        "risk_amount": None,
+        "entry": None,
+        "safe_loss": None,
+        "tp1": None,
+        "tp3": None,
+        "tp2": None,
+        "rr_tp1": None,
+        "rr_tp3": None,
+        "rr_tp2": None,
+        "raw_quantity": None,
+        "calculated_position_size": None,
+        "estimated_stop_risk": None,
+        "estimated_margin_requirement": None,
+        "sizing_note": (
+            "Position size is calculated only when the instrument is "
+            "quoted in the account currency and broker lot metadata "
+            "is available. Margin requirement is not estimated here."
+        ),
+        "error": None,
+    }
+
+    candidate_source = None
+
+    # A risk-sized execution candidate must come from this export's fresh
+    # analysis generation. Never size an older monitor/pending snapshot.
+    for exported_instrument in exported_instruments:
+        if not isinstance(exported_instrument, dict):
+            continue
+
+        fresh_analysis = exported_instrument.get("bridge_analysis")
+        if not isinstance(fresh_analysis, dict):
+            continue
+
+        if fresh_analysis.get("decision") != "APPROVE":
+            continue
+
+        fresh_trade_plan = fresh_analysis.get("trade_plan")
+        if not isinstance(fresh_trade_plan, dict):
+            continue
+
+        if not fresh_trade_plan.get("valid"):
+            continue
+
+        candidate_source = {
+            "instrument": (
+                exported_instrument.get("symbol")
+                or fresh_analysis.get("symbol")
+            ),
+            "direction": (
+                "LONG"
+                if fresh_analysis.get("directional_bias") == "bullish"
+                else "SHORT"
+                if fresh_analysis.get("directional_bias") == "bearish"
+                else None
+            ),
+            "entry_reference": fresh_trade_plan.get("entry_reference"),
+            "safe_loss": fresh_trade_plan.get("safe_loss"),
+            "tp1": fresh_trade_plan.get("tp1"),
+            "tp2": fresh_trade_plan.get("tp2"),
+            "tp3": fresh_trade_plan.get("tp3"),
+            "rr_tp1": fresh_trade_plan.get("rr_tp1"),
+            "rr_tp2": fresh_trade_plan.get("rr_tp2"),
+            "rr_tp3": fresh_trade_plan.get("rr_tp3"),
+            "analysis_source": "fresh_export_analysis",
+        }
+        break
+
+    if isinstance(candidate_source, dict):
+        try:
+            instrument = candidate_source.get("instrument")
+
+            if "entry_reference" in candidate_source:
+                entry = candidate_source.get("entry_reference")
+                safe_loss = candidate_source.get("safe_loss")
+                tp1 = candidate_source.get("tp1")
+                tp3 = candidate_source.get("tp3")
+                tp2 = candidate_source.get("tp2")
+                rr_tp1 = candidate_source.get("rr_tp1")
+                rr_tp3 = candidate_source.get("rr_tp3")
+                rr_tp2 = candidate_source.get("rr_tp2")
+                direction = candidate_source.get("direction")
+            else:
+                entry = candidate_source.get("entry")
+                safe_loss = candidate_source.get("safe_loss")
+                tp1 = candidate_source.get("take_profit_1")
+                tp3 = candidate_source.get("take_profit_3")
+                tp2 = candidate_source.get("take_profit_2")
+                rr_tp1 = candidate_source.get("rr_tp1")
+                rr_tp3 = candidate_source.get("rr_tp3")
+                rr_tp2 = candidate_source.get("rr_tp2")
+                direction = candidate_source.get("direction")
+
+            spec = None
+
+            for exported in exported_instruments:
+                if exported.get("symbol") == instrument:
+                    spec = exported.get("instrument_specs")
+                    break
+
+            if not isinstance(spec, dict) or not spec.get("available"):
+                raise RiskSizingError(
+                    "Instrument specifications are unavailable."
+                )
+
+            balance = account_risk_snapshot.get("balance")
+            available_funds = account_risk_snapshot.get("free_margin")
+
+            if balance is None:
+                raise RiskSizingError(
+                    "Account balance is unavailable."
+                )
+
+            quote_currency = spec.get("quote_currency")
+            account_currency = (
+                account_risk_snapshot
+                .get("raw_tradelocker_state", {})
+                .get("currency")
+                if isinstance(
+                    account_risk_snapshot.get("raw_tradelocker_state"),
+                    dict,
+                )
+                else None
+            )
+
+            # If TradeLocker does not expose account currency in this
+            # state payload, do not guess. Use USD only when the account
+            # metadata explicitly reports it elsewhere in future.
+            if account_currency is None:
+                account_currency = quote_currency
+
+            if (
+                quote_currency
+                and account_currency
+                and str(quote_currency).upper()
+                != str(account_currency).upper()
+            ):
+                raise RiskSizingError(
+                    "Currency conversion is required before sizing."
+                )
+
+            spec_cache = spec.get("cache") if isinstance(spec, dict) else None
+
+            if (
+                isinstance(spec_cache, dict)
+                and spec_cache.get("stale") is True
+            ):
+                try:
+                    refreshed_raw_details = await _export_retry(
+                        specs_connector.get_instrument_details,
+                        tradable_instrument_id=int(
+                            spec["tradable_instrument_id"]
+                        ),
+                        route_id=int(spec["route_id"]),
+                        acc_num=str(account.external_account_number),
+                    )
+
+                    refreshed_details = _instrument_details_payload(
+                        refreshed_raw_details
+                    )
+
+                    refreshed_min_lot = refreshed_details.get("minLot")
+                    refreshed_max_lot = refreshed_details.get("maxLot")
+                    refreshed_lot_step = refreshed_details.get("lotStep")
+                    refreshed_contract_size = refreshed_details.get("lotSize")
+
+                    if (
+                        refreshed_min_lot is None
+                        or refreshed_lot_step is None
+                        or refreshed_contract_size is None
+                    ):
+                        raise RuntimeError(
+                            "Live TradeLocker sizing metadata is incomplete."
+                        )
+
+                    refreshed_at = datetime.now(timezone.utc).isoformat()
+
+                    spec.update(
+                        {
+                            "minimum_lot": refreshed_min_lot,
+                            "maximum_lot": refreshed_max_lot,
+                            "lot_step": refreshed_lot_step,
+                            "contract_size": refreshed_contract_size,
+                            "raw_details": refreshed_raw_details,
+                            "cache": {
+                                "source": "live_sizing_refresh",
+                                "captured_at": refreshed_at,
+                                "age_seconds": 0,
+                                "stale": False,
+                            },
+                        }
+                    )
+
+                    refreshed_spec_cache_key = (
+                        f"{account.external_account_id}:"
+                        f"{spec['tradable_instrument_id']}:"
+                        f"{spec['route_id']}"
+                    )
+
+                    set_cached(
+                        "instrument_specs",
+                        refreshed_spec_cache_key,
+                        refreshed_raw_details,
+                    )
+
+                    spec_cache = spec.get("cache")
+
+                except Exception as refresh_error:
+                    raise RiskSizingError(
+                        "Fresh TradeLocker instrument specifications are required "
+                        "before position sizing; live refresh failed: "
+                        f"{type(refresh_error).__name__}: {refresh_error}"
+                    ) from refresh_error
+
+            if (
+                isinstance(spec_cache, dict)
+                and spec_cache.get("stale") is True
+            ):
+                raise RiskSizingError(
+                    "Fresh TradeLocker instrument specifications are required "
+                    "before position sizing."
+                )
+
+            proposed_risk_percent = MAX_RISK_PERCENT
+
+            # Account-currency risk conversion.
+            #
+            # calculate_position_size() must receive monetary
+            # risk per price unit expressed in the account currency.
+            account_currency = "USD"
+            base_currency = (
+                str(spec.get("base_currency") or "").upper()
+                or None
+            )
+            quote_currency = (
+                str(spec.get("quote_currency") or "").upper()
+                or None
+            )
+            contract_size = float(spec["contract_size"])
+
+            if quote_currency == account_currency:
+                # EURUSD, GBPUSD, XAUUSD, BTCUSD and
+                # other instruments whose P/L is already USD.
+                risk_conversion_factor = 1.0
+                risk_conversion_basis = (
+                    "quote_currency_equals_account_currency"
+                )
+
+            elif base_currency == account_currency:
+                # Example: USDJPY.
+                # Stop loss is generated in quote currency and
+                # converted back to USD at the Safe Loss rate.
+                if float(safe_loss) <= 0:
+                    raise RiskSizingError(
+                        "Safe Loss must be positive for "
+                        "base-currency risk conversion."
+                    )
+
+                risk_conversion_factor = (
+                    1.0 / float(safe_loss)
+                )
+                risk_conversion_basis = (
+                    "account_currency_is_base_currency;"
+                    "quote_loss_converted_at_safe_loss"
+                )
+
+            else:
+                # Never guess an FX conversion rate.
+                raise RiskSizingError(
+                    "Safe account-currency conversion is unavailable "
+                    f"for {instrument}: base={base_currency!r}, "
+                    f"quote={quote_currency!r}, "
+                    f"account={account_currency!r}. "
+                    "Sizing is refused rather than estimating risk "
+                    "with an unverified FX conversion."
+                )
+
+            effective_risk_lot_size = (
+                contract_size * risk_conversion_factor
+            )
+
+            if effective_risk_lot_size <= 0:
+                raise RiskSizingError(
+                    "Converted monetary risk per lot is invalid."
+                )
+
+            sizing = calculate_position_size(
+                balance=float(balance),
+                risk_percent=proposed_risk_percent,
+                entry=float(entry),
+                safe_loss=float(safe_loss),
+                lot_size=effective_risk_lot_size,
+                lot_step=float(spec["lot_step"]),
+                min_lot=float(spec["minimum_lot"]),
+                available_funds=(
+                    float(available_funds)
+                    if available_funds is not None
+                    else None
+                ),
+            )
+
+            # Independent verification after broker lot rounding.
+            verified_estimated_loss_at_safe_loss = (
+                abs(float(entry) - float(safe_loss))
+                * contract_size
+                * float(sizing.quantity)
+                * risk_conversion_factor
+            )
+
+            risk_cap_amount = (
+                float(balance)
+                * float(proposed_risk_percent)
+                / 100.0
+            )
+
+            if (
+                verified_estimated_loss_at_safe_loss
+                > risk_cap_amount + 1e-9
+            ):
+                raise RiskSizingError(
+                    "Verified estimated loss at Safe Loss exceeds "
+                    "the configured account risk cap after broker "
+                    "lot rounding."
+                )
+            risk_sized_candidate.update(
+                {
+                    "available": True,
+                    "instrument": instrument,
+                    "direction": direction,
+                    "proposed_risk_percent": proposed_risk_percent,
+                    "risk_amount": sizing.risk_budget,
+                    "entry": entry,
+                    "safe_loss": safe_loss,
+                    "tp1": tp1,
+                    "tp3": tp3,
+                    "tp2": tp2,
+                    "rr_tp1": rr_tp1,
+                    "rr_tp3": rr_tp3,
+                    "rr_tp2": rr_tp2,
+                    "raw_quantity": sizing.raw_quantity,
+                    "calculated_position_size": sizing.quantity,
+                    "estimated_stop_risk": sizing.estimated_stop_risk,
+                    "estimated_loss_at_safe_loss": round(
+                        verified_estimated_loss_at_safe_loss,
+                        2,
+                    ),
+                    "risk_cap_amount": round(
+                        risk_cap_amount,
+                        2,
+                    ),
+                    "risk_cap_verified": (
+                        verified_estimated_loss_at_safe_loss
+                        <= risk_cap_amount + 1e-9
+                    ),
+                    "account_currency": account_currency,
+                    "base_currency": base_currency,
+                    "quote_currency": quote_currency,
+                    "contract_size": contract_size,
+                    "risk_conversion_factor": (
+                        risk_conversion_factor
+                    ),
+                    "risk_conversion_basis": (
+                        risk_conversion_basis
+                    ),
+                    "risk_sizing_model": (
+                        "account_currency_loss_verified_after_"
+                        "broker_lot_rounding"
+                    ),
+                }
+            )
+
+        except Exception as error:
+            risk_sized_candidate["error"] = (
+                f"{type(error).__name__}: {error}"
+            )
+
+    # --------------------------------------------------
+    # R:R audit metadata.
+    #
+    # geometry.reward_to_risk is a structural room/opportunity
+    # metric using the geometry invalidation/target reference.
+    #
+    # trade_plan.rr_tp1 / rr_tp3 / rr_tp2 are the actual
+    # reward-to-risk values using the final Safe Loss and
+    # structure-derived take-profit levels.
+    #
+    # trade_plan.valid means structural geometry is coherent.
+    # It is NOT equivalent to "attractive", "approved", or
+    # "executable".
+    # --------------------------------------------------
+
+    rr_audit = {
+        "geometry_metric": {
+            "field": "bridge_analysis.geometry.reward_to_risk",
+            "recommended_name": "structural_room_rr",
+            "meaning": (
+                "Structural room/opportunity relative to the geometry "
+                "invalidation reference. This is contextual and must not "
+                "be treated as the execution trade-plan R:R."
+            ),
+        },
+        "trade_plan_metrics": {
+            "fields": [
+                "bridge_analysis.trade_plan.rr_tp1",
+                "bridge_analysis.trade_plan.rr_tp3",
+                "bridge_analysis.trade_plan.rr_tp2",
+            ],
+            "meaning": (
+                "Actual reward-to-risk using the final Safe Loss and "
+                "the structure-derived TP1, TP3, and TP2 levels."
+            ),
+        },
+        "validity_semantics": {
+            "trade_plan_valid_means": (
+                "Structural trade geometry is internally coherent."
+            ),
+            "trade_plan_valid_does_not_mean": [
+                "approved",
+                "high-quality reward-to-risk",
+                "actionable",
+                "execution-authorized",
+            ],
+        },
+        "external_ai_instruction": (
+            "Review structural_room_rr and trade-plan R:R separately. "
+            "A strong structural-room metric must not override poor "
+            "actual Safe-Loss-to-target R:R."
+        ),
+    }
+
+    # --------------------------------------------------
+    # Export completeness summary.
+    # --------------------------------------------------
+
+    candle_status_rows = []
+
+    for exported in exported_instruments:
+        for timeframe, tf_data in (
+            exported.get("timeframes") or {}
+        ).items():
+            status = (
+                tf_data.get("candle_status")
+                if isinstance(tf_data, dict)
+                else None
+            )
+
+            if isinstance(status, dict):
+                candle_status_rows.append(status)
+
+    candles_complete = bool(candle_status_rows) and all(
+        not bool(row.get("incomplete"))
+        and not bool(row.get("stale"))
+        for row in candle_status_rows
+    )
+
+    known_ages = [
+        row.get("data_age_seconds")
+        for row in candle_status_rows
+        if isinstance(row.get("data_age_seconds"), (int, float))
+    ]
+
+    max_data_age_seconds = (
+        max(known_ages)
+        if known_ages
+        else None
+    )
+
+    # Current alert recommendations must be derived from this export's
+    # fresh analysis generation. Historical monitor alerts are context
+    # only and must never silently become current Atlas instructions.
+    fresh_watch_conditions = []
+    recommended_alerts = []
+
+    for _exported in exported_instruments:
+        if not isinstance(_exported, dict):
+            continue
+
+        _analysis = _exported.get("bridge_analysis")
+        if not isinstance(_analysis, dict):
+            continue
+
+        if _analysis.get("decision") != "WATCH":
+            continue
+
+        _symbol = _exported.get("symbol") or _analysis.get("symbol")
+        _reason = _analysis.get("reason")
+        _geometry = _analysis.get("geometry")
+        _execution = _analysis.get("execution_5m")
+
+        fresh_watch_conditions.append(
+            {
+                "instrument": _symbol,
+                "decision": "WATCH",
+                "reason": _reason,
+                "geometry": _geometry,
+                "execution_5m": _execution,
+                "alert_created": False,
+                "alert_gate_reason": (
+                    "Fresh WATCH analysis does not expose a complete, "
+                    "machine-testable structural price trigger with "
+                    "direction, confirmation condition, cancel level, "
+                    "and expiry. No alert is manufactured."
+                ),
+            }
+        )
+
+    watch_advisory = {
+        "source": "fresh_export_analysis",
+        "alert_policy": "fresh_structural_triggers_only",
+        "recommended_alerts": recommended_alerts,
+        "alerts": recommended_alerts,
+        "recommended_alert_count": len(recommended_alerts),
+        "zero_alerts_allowed": True,
+        "historical_monitor_alerts_excluded": True,
+        "fresh_watch_conditions": fresh_watch_conditions,
+        "quality_gate": {
+            "requires_fresh_analysis": True,
+            "requires_structural_meaning": True,
+            "requires_explicit_trigger_price": True,
+            "requires_trigger_direction": True,
+            "requires_confirmation_condition": True,
+            "requires_cancel_level": True,
+            "requires_expiry": True,
+            "reject_duplicate_thesis_alerts": True,
+            "speculative_price_alerts_forbidden": True,
+        },
+        "note": (
+            "The Bridge may return zero recommended alerts. A price level "
+            "is not an alert merely because price could reach it. Until "
+            "fresh analysis exposes a fully auditable structural trigger, "
+            "Atlas should decide whether any alert is warranted."
+        ),
+    }
+    # --------------------------------------------------
+    # Final MVP export consistency layer.
+    # --------------------------------------------------
+    analysis_snapshot_id = (
+        "atlas-analysis-"
+        + __import__("uuid").uuid4().hex
+    )
+
+    # Attach an explicit executable-side live market
+    # reference without replacing structural/pending entry.
+    for _export_item in exported_instruments:
+        if not isinstance(_export_item, dict):
+            continue
+
+        _market = _export_item.get("market_snapshot")
+        if not isinstance(_market, dict):
+            continue
+
+        _analysis = _export_item.get("bridge_analysis") or {}
+        _plan = _analysis.get("trade_plan") or {}
+
+        _direction = str(
+            _analysis.get("directional_bias")
+            or _plan.get("direction")
+            or ""
+        ).upper()
+
+        _live_bid = _market.get("live_bid")
+        if _live_bid is None:
+            _live_bid = _market.get("bid")
+
+        _live_ask = _market.get("live_ask")
+        if _live_ask is None:
+            _live_ask = _market.get("ask")
+
+        _live_entry = None
+        _live_side = None
+
+        if _direction == "LONG":
+            _live_entry = _live_ask
+            _live_side = "ASK"
+        elif _direction == "SHORT":
+            _live_entry = _live_bid
+            _live_side = "BID"
+
+        _market["live_executable_market_entry"] = (
+            _live_entry
+        )
+        _market["live_executable_market_entry_side"] = (
+            _live_side
+        )
+        _market[
+            "live_executable_market_entry_is_authorization"
+        ] = False
+        _market["market_entry_price_policy"] = (
+            "LONG market execution evaluates live ask; "
+            "SHORT market execution evaluates live bid. "
+            "Structural or pending entry_reference remains "
+            "context and must be reassessed before approval."
+        )
+
+        if isinstance(_plan, dict) and _plan:
+            _plan["live_market_entry_reference"] = (
+                _live_entry
+            )
+            _plan["live_market_entry_reference_side"] = (
+                _live_side
+            )
+            _plan[
+                "live_market_entry_reference_is_authorization"
+            ] = False
+
+    # A discovered market must never disappear silently.
+    _deep_scan_output_symbols = [
+        item.get("symbol")
+        for item in exported_instruments
+        if isinstance(item, dict) and item.get("symbol")
+    ]
+    _deep_scan_output_set = set(
+        _deep_scan_output_symbols
+    )
+
+    market_discovery["deep_scan_output_symbols"] = list(
+        _deep_scan_output_symbols
+    )
+    market_discovery["deep_scan_output_count"] = len(
+        _deep_scan_output_symbols
+    )
+    market_discovery["deep_scan_missing_symbols"] = [
+        symbol
+        for symbol in requested_symbols
+        if symbol not in _deep_scan_output_set
+    ]
+    market_discovery["deep_scan_missing_count"] = len(
+        market_discovery["deep_scan_missing_symbols"]
+    )
+    market_discovery["deep_scan_missing_requires_review"] = (
+        bool(market_discovery["deep_scan_missing_symbols"])
+    )
+    market_discovery["deep_scan_completeness_note"] = (
+        "Symbols selected by discovery but absent from the "
+        "deep-analysis export are explicitly listed here. "
+        "Absence is never treated as successful analysis."
+    )
+
+    workflow_ready = (
+        bool(exported_instruments)
+        and candles_complete
+    )
+
+    generated = datetime.now(timezone.utc)
+
+    match_trader_translation = (
+        _translate_match_trader_trade_plan(
+            frozen_trade_plan=frozen_trade_plan,
+            exported_instruments=exported_instruments,
+            match_trader_cross_reference=(
+                match_trader_cross_reference
+            ),
+        )
+    )
+
+    match_trader_sizing = await _size_match_trader_trade_plan(
+        match_trader_translation
+    )
+
+    tradelocker_order_source = (
+        risk_sized_candidate
+        if isinstance(risk_sized_candidate, dict)
+        and risk_sized_candidate.get("available")
+        else None
+    )
+
+    tradelocker_order = {
+        "available": isinstance(tradelocker_order_source, dict),
+        "instrument": (
+            tradelocker_order_source.get("instrument")
+            if isinstance(tradelocker_order_source, dict)
+            else None
+        ),
+        "direction": (
+            tradelocker_order_source.get("direction")
+            if isinstance(tradelocker_order_source, dict)
+            else None
+        ),
+        "order_type": (
+            tradelocker_order_source.get("order_type")
+            if isinstance(tradelocker_order_source, dict)
+            else None
+        ),
+        "entry": (
+            tradelocker_order_source.get("entry")
+            if isinstance(tradelocker_order_source, dict)
+            else None
+        ),
+        "safe_loss": (
+            tradelocker_order_source.get("safe_loss")
+            if isinstance(tradelocker_order_source, dict)
+            else None
+        ),
+        "tp1": (
+            tradelocker_order_source.get("tp1")
+            if isinstance(tradelocker_order_source, dict)
+            and "tp1" in tradelocker_order_source
+            else (
+                tradelocker_order_source.get("take_profit_1")
+                if isinstance(tradelocker_order_source, dict)
+                else None
+            )
+        ),
+        "tp2": (
+            tradelocker_order_source.get("tp2")
+            if isinstance(tradelocker_order_source, dict)
+            and "tp2" in tradelocker_order_source
+            else (
+                tradelocker_order_source.get("take_profit_2")
+                if isinstance(tradelocker_order_source, dict)
+                else None
+            )
+        ),
+        "tp3": (
+            tradelocker_order_source.get("tp3")
+            if isinstance(tradelocker_order_source, dict)
+            and "tp3" in tradelocker_order_source
+            else (
+                tradelocker_order_source.get("take_profit_3")
+                if isinstance(tradelocker_order_source, dict)
+                else None
+            )
+        ),
+        "lot_vol": (
+            risk_sized_candidate.get("calculated_position_size")
+            if isinstance(risk_sized_candidate, dict)
+            and risk_sized_candidate.get("available")
+            else None
+        ),
+        "risk_percent": (
+            risk_sized_candidate.get("proposed_risk_percent")
+            if isinstance(risk_sized_candidate, dict)
+            and risk_sized_candidate.get("available")
+            else None
+        ),
+        "estimated_stop_risk": (
+            risk_sized_candidate.get("estimated_stop_risk")
+            if isinstance(risk_sized_candidate, dict)
+            and risk_sized_candidate.get("available")
+            else None
+        ),
+    }
+
+    mt_plan = match_trader_translation.get(
+        "translated_trade_plan"
+    )
+
+    match_trader_order = {
+        "available": bool(
+            match_trader_translation.get("available")
+            and match_trader_sizing.get("available")
+            and isinstance(mt_plan, dict)
+        ),
+        "instrument": (
+            mt_plan.get("instrument")
+            if isinstance(mt_plan, dict)
+            else None
+        ),
+        "alias": (
+            mt_plan.get("alias")
+            if isinstance(mt_plan, dict)
+            else None
+        ),
+        "direction": (
+            mt_plan.get("direction")
+            if isinstance(mt_plan, dict)
+            else None
+        ),
+        "order_type": (
+            mt_plan.get("order_type")
+            if isinstance(mt_plan, dict)
+            else None
+        ),
+        "entry": (
+            mt_plan.get("entry")
+            if isinstance(mt_plan, dict)
+            else None
+        ),
+        "safe_loss": (
+            mt_plan.get("safe_loss")
+            if isinstance(mt_plan, dict)
+            else None
+        ),
+        "tp1": (
+            mt_plan.get("take_profit_1")
+            if isinstance(mt_plan, dict)
+            else None
+        ),
+        "tp2": (
+            mt_plan.get("take_profit_2")
+            if isinstance(mt_plan, dict)
+            else None
+        ),
+        "tp3": (
+            mt_plan.get("take_profit_3")
+            if isinstance(mt_plan, dict)
+            else None
+        ),
+        "lot_vol": match_trader_sizing.get(
+            "calculated_position_size"
+        ),
+        "risk_percent": match_trader_sizing.get(
+            "risk_percent"
+        ),
+        "estimated_stop_risk": match_trader_sizing.get(
+            "estimated_stop_risk"
+        ),
+        "translation_status": (
+            match_trader_translation.get(
+                "translation_status"
+            )
+        ),
+        "sizing_error": match_trader_sizing.get("error"),
+    }
+
+    side_by_side_order = {
+        "available": bool(
+            tradelocker_order.get("available")
+        ),
+        "primary_trade_source": "TradeLocker",
+        "match_trader_role": (
+            "price_cross_reference_and_order_translation_only"
+        ),
+        "match_trader_required_for_decision": False,
+        "match_trader_failure_blocks_tradelocker_order": False,
+        "read_only": True,
+        "execution_authorized": False,
+        "manual_user_execution_required": True,
+        "tradelocker": tradelocker_order,
+        "match_trader": match_trader_order,
+    }
+
+    _finish_stage("stage_4_analysis")
+
+    export_payload = {
+        "schema": "atlas-ai-bridge-scan-v2",
+        "purpose": "Atlas scan and monitor handoff for external AI review",
+        "generated_at": generated.isoformat(),
+        "timezone": "UTC",
+
+        "atlas_context": {
+            "bootstrap": bootstrap_snapshot,
+            "monitor": {
+                "running": monitor_snapshot.get("running"),
+                "nickname": monitor_snapshot.get("nickname"),
+                "symbols": monitor_snapshot.get("symbols"),
+                "interval_seconds": monitor_snapshot.get("interval_seconds"),
+                "started_at": monitor_snapshot.get("started_at"),
+                "last_scan_at": monitor_snapshot.get("last_scan_at"),
+                "scan_count": monitor_snapshot.get("scan_count"),
+                "last_error": monitor_snapshot.get("last_error"),
+                # Legacy compatibility fields.
+                "actionable_trade_found": monitor_snapshot.get(
+                    "actionable_trade_found"
+                ),
+                "actionable_instrument": monitor_snapshot.get(
+                    "actionable_instrument"
+                ),
+
+                # Current read-only workflow semantics.
+                "candidate_ready_for_review": monitor_snapshot.get(
+                    "candidate_ready_for_review"
+                ),
+                "candidate_instrument": monitor_snapshot.get(
+                    "candidate_instrument"
+                ),
+                "workflow_state": monitor_snapshot.get(
+                    "workflow_state"
+                ),
+                "external_ai_review_status": monitor_snapshot.get(
+                    "external_ai_review_status"
+                ),
+
+                "stop_reason": monitor_snapshot.get("stop_reason"),
+            },
+        },
+
+        "persistent_alerts": {
+            "active_at_export_start": active_alert_snapshot,
+            "evaluated": alert_evaluations,
+            "triggered": triggered_alerts,
+            "triggered_count": len(triggered_alerts),
+            "external_ai_reassessment_required": bool(
+                triggered_alerts
+            ),
+            "read_only": True,
+            "broker_order_submitted": False,
+            "note": (
+                "Triggered alerts require fresh external Atlas "
+                "reassessment. They never authorize execution."
+            ),
+        },
+
+        "external_ai_workflow": {
+            "bridge_role": "READ_ONLY_MARKET_INTELLIGENCE",
+            "execution_allowed": False,
+            "candidate_status_meaning": (
+                "AWAITING_EXTERNAL_AI_REVIEW means the Bridge found and "
+                "froze a setup worthy of independent Atlas review. "
+                "It is not trade authorization."
+            ),
+            "allowed_external_ai_decisions": [
+                "APPROVE",
+                "WATCH",
+                "REJECT",
+            ],
+            "decision_meanings": {
+                "APPROVE": (
+                    "Recommend the frozen setup to the user for manual "
+                    "placement. This does not authorize Bridge execution."
+                ),
+                "WATCH": (
+                    "Do not recommend the trade yet. Return monitoring "
+                    "conditions so the Bridge can continue observing it."
+                ),
+                "REJECT": (
+                    "Discard the frozen candidate as unsuitable."
+                ),
+            },
+            "review_protocol": [
+                "Reassess the frozen candidate using the freshest market data.",
+                "Check account state, exposure, spreads, candles, and data freshness.",
+                "Do not treat the frozen trade plan as authorization.",
+                "Return exactly one decision: APPROVE, WATCH, or REJECT.",
+                "If WATCH is selected, provide explicit monitoring conditions.",
+                "If APPROVE is selected, present the final setup to the user.",
+            ],
+            "user_execution_required": True,
+            "execution_instruction": (
+                "The Bridge cannot execute trades. If APPROVE is returned, "
+                "present the final trade plan to the user for manual placement "
+                "through their permitted copy-trading workflow."
+            ),
+        },
+
+        "market_discovery": market_discovery,
+        "external_review_requirements": {
+            "fresh_market_reassessment_required": True,
+            "fresh_web_news_check_required": True,
+            "fresh_economic_calendar_check_required": True,
+            "fresh_macro_context_required": True,
+            "use_live_ask_for_long_market_entry": True,
+            "use_live_bid_for_short_market_entry": True,
+            "pending_entries_must_be_reassessed": True,
+            "bridge_analysis_is_trade_authorization": False,
+            "instruction": (
+                "Before APPROVE, independently reassess the "
+                "current market, relevant breaking news, macro "
+                "conditions, and economic-calendar risk. Treat "
+                "all Bridge plans and historical monitor state "
+                "as decision context, never authorization."
+            ),
+        },
+        "workflow_snapshot": {
+            "source": "fresh_export_analysis",
+            "analysis_snapshot_id": analysis_snapshot_id,
+            "previous_monitor_snapshot": latest_result,
+            "previous_monitor_snapshot_is_historical": True,
+            "analysis_generated_at": generated.isoformat(),
+            "fresh_instrument_count": len(exported_instruments),
+            "workflow_ready": workflow_ready,
+            "previous_monitor_context": latest_result,
+            "previous_frozen_trade_plan": frozen_trade_plan,
+            "previous_monitor_context_is_historical": True,
+        },
+
+        "match_trader_cross_reference": match_trader_cross_reference,
+        "match_trader_translation": match_trader_translation,
+        "match_trader_sizing": match_trader_sizing,
+        "side_by_side_order": side_by_side_order,
+
+        "data_source": "TradeLocker",
+
+        "account_risk_snapshot": account_risk_snapshot,
+        "current_exposure": current_exposure,
+        "watch_advisory": watch_advisory,
+        "risk_sized_execution_candidate": risk_sized_candidate,
+        "rr_audit": rr_audit,
+
+        "account": {
+            "nickname": account.nickname,
+            "platform": getattr(
+                account.platform,
+                "value",
+                str(account.platform),
+            ),
+            "environment": getattr(
+                account.environment,
+                "value",
+                str(account.environment),
+            ),
+        },
+        "request": {
+            "mode": "full_ai_review",
+            "symbols": requested_symbols,
+            "timeframes": TIMEFRAMES,
+        },
+        "scan_status": {
+            "requested": batch["requested"],
+            "successful": batch["successful"],
+            "failed": batch["failed"],
+            "errors": batch["errors"],
+        },
+        "instruments": exported_instruments,
+        "export_completeness": {
+            "quotes_available": (
+                quotes_available_count == len(exported_instruments)
+                and len(exported_instruments) > 0
+            ),
+            "account_state_available": (
+                raw_account_state is not None
+            ),
+            "positions_available": current_exposure["available"],
+            "instrument_specs_available": (specs_available_count == len(exported_instruments) and len(exported_instruments) > 0),
+            "candles_complete": candles_complete,
+            "data_age_seconds": max_data_age_seconds,
+            "external_ai_decision_ready": workflow_ready,
+        },
+
+        "safety": {
+            "read_only": True,
+            "contains_trade_authorization": False,
+            "contains_execution_instruction": False,
+            "bridge_execution_disabled": True,
+            "manual_user_execution_required": True,
+            "external_ai_may_review": True,
+            "external_ai_must_reassess_current_market": True,
+            "frozen_trade_plan_is_context_not_authorization": True,
+        },
+    }
+
+    _finish_stage("stage_5_payload_assembly")
+
+    # ATLAS_FINAL_RETURNED_PAYLOAD_TRUTH_LAYER
+
+    # ------------------------------------------------------------
+    # Preserve the scanner's original report for diagnostics, then
+    # redefine the externally visible headline around completed
+    # deep analysis rather than merely successful scanner requests.
+    # ------------------------------------------------------------
+
+    _final_discovery = export_payload.get("market_discovery")
+    if not isinstance(_final_discovery, dict):
+        _final_discovery = {}
+        export_payload["market_discovery"] = _final_discovery
+
+    _final_scan = export_payload.get("scan_status")
+    if not isinstance(_final_scan, dict):
+        _final_scan = {}
+        export_payload["scan_status"] = _final_scan
+
+    _original_scan_report = dict(_final_scan)
+
+    _final_workflow = export_payload.get("workflow_snapshot")
+    if not isinstance(_final_workflow, dict):
+        _final_workflow = {}
+        export_payload["workflow_snapshot"] = _final_workflow
+
+
+    def _atlas_symbol_value(value):
+        if isinstance(value, str):
+            return value
+
+        if isinstance(value, dict):
+            return (
+                value.get("symbol")
+                or value.get("instrument")
+                or value.get("name")
+            )
+
+        return None
+
+
+    _final_selected_raw = (
+        _final_discovery.get("selected_symbols")
+        or requested_symbols
+        or []
+    )
+
+    _final_selected = []
+
+    for _item in _final_selected_raw:
+        _symbol = _atlas_symbol_value(_item)
+
+        if _symbol and _symbol not in _final_selected:
+            _final_selected.append(_symbol)
+
+
+    _final_deep = []
+
+    for _item in exported_instruments:
+        _symbol = _atlas_symbol_value(_item)
+
+        if _symbol and _symbol not in _final_deep:
+            _final_deep.append(_symbol)
+
+
+    _final_deep_set = set(_final_deep)
+
+    _final_deep_selected = [
+        symbol
+        for symbol in _final_selected
+        if symbol in _final_deep_set
+    ]
+
+    _final_missing = [
+        symbol
+        for symbol in _final_selected
+        if symbol not in _final_deep_set
+    ]
+
+    _final_complete = (
+        len(_final_selected) > 0
+        and len(_final_missing) == 0
+        and len(_final_deep_selected) == len(_final_selected)
+    )
+
+
+    # ------------------------------------------------------------
+    # Discovery / deep-analysis truth
+    # ------------------------------------------------------------
+
+    _final_discovery["deep_scan_output_symbols"] = list(
+        _final_deep
+    )
+
+    _final_discovery["deep_scan_output_count"] = len(
+        _final_deep
+    )
+
+    _final_discovery["deep_scan_successful_symbols"] = list(
+        _final_deep_selected
+    )
+
+    _final_discovery["deep_scan_missing_symbols"] = list(
+        _final_missing
+    )
+
+    _final_discovery["deep_scan_missing_count"] = len(
+        _final_missing
+    )
+
+    _final_discovery["deep_analysis_requested"] = len(
+        _final_selected
+    )
+
+    _final_discovery["deep_analysis_successful"] = len(
+        _final_deep_selected
+    )
+
+    _final_discovery["deep_analysis_missing"] = len(
+        _final_missing
+    )
+
+    _final_discovery["overall_scan_complete"] = _final_complete
+
+    _final_discovery["deep_scan_failure_records"] = [
+        {
+            "symbol": symbol,
+            "stage": "deep_multitimeframe_analysis",
+            "status": "NO_DEEP_ANALYSIS_RESULT",
+            "reason": (
+                "Selected by market discovery but absent from the "
+                "returned deep-analysis instrument set. This symbol "
+                "is not counted as successfully analyzed."
+            ),
+        }
+        for symbol in _final_missing
+    ]
+
+
+    # ------------------------------------------------------------
+    # Correct the externally visible scan_status semantics.
+    # ------------------------------------------------------------
+
+    _final_scan.clear()
+
+    _final_scan.update(
+        {
+            "requested": len(_final_selected),
+            "successful": len(_final_deep_selected),
+            "failed": len(_final_missing),
+
+            "discovery_requested": len(_final_selected),
+            "discovery_successful": len(_final_selected),
+
+            "deep_analysis_requested": len(_final_selected),
+            "deep_analysis_successful": len(_final_deep_selected),
+            "deep_analysis_missing": len(_final_missing),
+
+            "overall_scan_complete": _final_complete,
+
+            "deep_analysis_missing_symbols": list(
+                _final_missing
+            ),
+
+            "deep_analysis_failure_records": list(
+                _final_discovery[
+                    "deep_scan_failure_records"
+                ]
+            ),
+
+            "underlying_batch_report": _original_scan_report,
+        }
+    )
+
+
+    # ------------------------------------------------------------
+    # workflow_ready may not claim readiness when discovery chose
+    # an instrument that never completed deep analysis.
+    # ------------------------------------------------------------
+
+    _previous_workflow_ready = bool(
+        _final_workflow.get("workflow_ready")
+    )
+
+    _final_workflow["workflow_ready"] = bool(
+        _previous_workflow_ready
+        and _final_complete
+    )
+
+    _final_workflow[
+        "workflow_ready_requires_complete_deep_analysis"
+    ] = True
+
+    _final_workflow[
+        "deep_analysis_missing_symbols"
+    ] = list(_final_missing)
+
+    _final_workflow[
+        "overall_scan_complete"
+    ] = _final_complete
+
+
+    # ------------------------------------------------------------
+    _finish_stage("stage_6_truth_layer")
+
+    # Bootstrap runtime verification.
+    #
+    # configured hash:
+    #   hash reported by bootstrap_status()
+    #
+    # current disk hash:
+    #   what is on disk at export time
+    #
+    # runtime-loaded hash:
+    #   hash captured by app.routes.bootstrap when that module was
+    #   imported into this running backend process.
+    # ------------------------------------------------------------
+
+    import hashlib as _atlas_final_hashlib
+    from pathlib import Path as _AtlasFinalPath
+
+    _bootstrap_configured_sha = None
+    _bootstrap_runtime_sha = None
+    _bootstrap_current_disk_sha = None
+    _bootstrap_path = None
+    _bootstrap_runtime_status = "UNKNOWN"
+    _bootstrap_verification_basis = (
+        "Insufficient evidence to compare configured, runtime, "
+        "and current bootstrap hashes."
+    )
+
+    if isinstance(bootstrap_snapshot, dict):
+        _bootstrap_configured_sha = bootstrap_snapshot.get(
+            "sha256"
+        )
+
+        _bootstrap_path = bootstrap_snapshot.get(
+            "path"
+        )
+
+    try:
+        _bootstrap_module = __import__(
+            "app.routes.bootstrap",
+            fromlist=[
+                "_RUNTIME_LOADED_BOOTSTRAP_SHA256"
+            ],
+        )
+
+        _bootstrap_runtime_sha = getattr(
+            _bootstrap_module,
+            "_RUNTIME_LOADED_BOOTSTRAP_SHA256",
+            None,
+        )
+
+    except Exception:
+        _bootstrap_runtime_sha = None
+
+
+    try:
+        if _bootstrap_path:
+            _bootstrap_file = _AtlasFinalPath(
+                str(_bootstrap_path)
+            )
+
+            if not _bootstrap_file.is_absolute():
+                _bootstrap_file = (
+                    _AtlasFinalPath.cwd()
+                    / _bootstrap_file
+                ).resolve()
+
+            if _bootstrap_file.exists():
+                _bootstrap_current_disk_sha = (
+                    _atlas_final_hashlib.sha256(
+                        _bootstrap_file.read_bytes()
+                    ).hexdigest()
+                )
+
+    except Exception:
+        _bootstrap_current_disk_sha = None
+
+
+    if (
+        _bootstrap_configured_sha
+        and _bootstrap_runtime_sha
+        and _bootstrap_current_disk_sha
+    ):
+        if (
+            _bootstrap_configured_sha
+            == _bootstrap_runtime_sha
+            == _bootstrap_current_disk_sha
+        ):
+            _bootstrap_runtime_status = "LOADED_CURRENT"
+            _bootstrap_verification_basis = (
+                "Configured bootstrap SHA-256, bootstrap "
+                "module startup SHA-256, and current on-disk "
+                "SHA-256 are identical."
+            )
+
+        elif (
+            _bootstrap_runtime_sha
+            != _bootstrap_current_disk_sha
+        ):
+            _bootstrap_runtime_status = "RESTART_PENDING"
+            _bootstrap_verification_basis = (
+                "The bootstrap file on disk differs from the "
+                "bootstrap hash captured by the running backend "
+                "process at module startup."
+            )
+
+        else:
+            _bootstrap_runtime_status = "UNKNOWN"
+            _bootstrap_verification_basis = (
+                "Bootstrap hashes are available but do not form "
+                "a provably current runtime state."
+            )
+
+
+    _bootstrap_verification = {
+        "bootstrap_runtime_status": (
+            _bootstrap_runtime_status
+        ),
+
+        "configured_bootstrap_sha256": (
+            _bootstrap_configured_sha
+        ),
+
+        "runtime_loaded_bootstrap_sha256": (
+            _bootstrap_runtime_sha
+        ),
+
+        "current_disk_bootstrap_sha256": (
+            _bootstrap_current_disk_sha
+        ),
+
+        "configured_bootstrap_path": (
+            str(_bootstrap_path)
+            if _bootstrap_path
+            else None
+        ),
+
+        "legacy_restart_required": (
+            bootstrap_snapshot.get("restart_required")
+            if isinstance(bootstrap_snapshot, dict)
+            else None
+        ),
+
+        "verification_basis": (
+            _bootstrap_verification_basis
+        ),
+    }
+
+    export_payload[
+        "bootstrap_runtime_verification"
+    ] = _bootstrap_verification
+
+    export_payload[
+        "bootstrap_runtime_status"
+    ] = _bootstrap_runtime_status
+
+    export_payload[
+        "configured_bootstrap_sha256"
+    ] = _bootstrap_configured_sha
+
+    export_payload[
+        "runtime_loaded_bootstrap_sha256"
+    ] = _bootstrap_runtime_sha
+
+    _finish_stage("stage_7_bootstrap_and_response")
+    export_payload["diagnostics"] = {
+        "patch002_timings_ms": dict(_timings_ms),
+        "timing_clock": "perf_counter",
+    }
+
+    timestamp = generated.strftime("%Y-%m-%d_%H-%M-%S")
+    nickname_part = _safe_filename_part(account.nickname)
+
+    filename = (
+        f"Atlas_AI_Scan_{nickname_part}_{timestamp}_UTC.json"
+    )
+
+    return Response(
+        content=json.dumps(
+            export_payload,
+            indent=2,
+            ensure_ascii=False,
+            default=str,
+        ),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{filename}"'
+            )
+        },
+    )
+
+
+# --- Background AI Scan export jobs ---
+
+_EXPORT_JOBS: dict[str, dict[str, Any]] = {}
+_EXPORT_TASKS: set[asyncio.Task[Any]] = set()
+
+
+async def _run_ai_scan_export_job(
+    job_id: str,
+    nickname: str,
+    symbols: list[str] | None,
+) -> None:
+    """Build an AI Scan export without holding the browser request open."""
+
+    job = _EXPORT_JOBS[job_id]
+
+    try:
+        response = await export_ai_scan(
+            nickname=nickname,
+            symbols=symbols,
+        )
+
+        disposition = response.headers.get(
+            "content-disposition",
+            "",
+        )
+
+        filename_match = re.search(
+            r'filename="?([^"]+)"?',
+            disposition,
+        )
+
+        filename = (
+            filename_match.group(1)
+            if filename_match
+            else f"Atlas_AI_Scan_{job_id}.json"
+        )
+
+        job.update(
+            {
+                "status": "READY",
+                "filename": filename,
+                "media_type": (
+                    response.media_type
+                    or "application/json"
+                ),
+                "content": bytes(response.body),
+                "error": None,
+                "completed_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+            }
+        )
+
+    except Exception as exc:
+        job.update(
+            {
+                "status": "FAILED",
+                "error": str(exc),
+                "completed_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+            }
+        )
+
+
+@router.post("/scan/{nickname}/export-ai/start")
+async def start_ai_scan_export(
+    nickname: str,
+    symbols: list[str] | None = Query(default=None),
+) -> dict[str, Any]:
+    """Start an AI Scan export and return immediately."""
+
+    job_id = uuid.uuid4().hex
+
+    _EXPORT_JOBS[job_id] = {
+        "job_id": job_id,
+        "nickname": nickname,
+        "symbols": symbols,
+        "status": "BUILDING",
+        "created_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        "completed_at": None,
+        "filename": None,
+        "media_type": None,
+        "content": None,
+        "error": None,
+    }
+
+    task = asyncio.create_task(
+        _run_ai_scan_export_job(
+            job_id=job_id,
+            nickname=nickname,
+            symbols=symbols,
+        )
+    )
+
+    _EXPORT_TASKS.add(task)
+    task.add_done_callback(_EXPORT_TASKS.discard)
+
+    return {
+        "job_id": job_id,
+        "status": "BUILDING",
+    }
+
+
+@router.get("/scan/export-ai/jobs/{job_id}")
+async def get_ai_scan_export_job(
+    job_id: str,
+) -> dict[str, Any]:
+    """Return background AI Scan export status."""
+
+    job = _EXPORT_JOBS.get(job_id)
+
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail="AI Scan export job not found.",
+        )
+
+    return {
+        "job_id": job["job_id"],
+        "nickname": job["nickname"],
+        "status": job["status"],
+        "created_at": job["created_at"],
+        "completed_at": job["completed_at"],
+        "filename": job["filename"],
+        "error": job["error"],
+    }
+
+
+@router.get("/scan/export-ai/jobs/{job_id}/download")
+async def download_ai_scan_export_job(
+    job_id: str,
+) -> Response:
+    """Download a completed background AI Scan export."""
+
+    job = _EXPORT_JOBS.get(job_id)
+
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail="AI Scan export job not found.",
+        )
+
+    if job["status"] == "FAILED":
+        raise HTTPException(
+            status_code=500,
+            detail=job["error"] or "AI Scan export failed.",
+        )
+
+    if job["status"] != "READY":
+        raise HTTPException(
+            status_code=409,
+            detail="AI Scan export is still building.",
+        )
+
+    content = job.get("content")
+
+    if not isinstance(content, (bytes, bytearray)):
+        raise HTTPException(
+            status_code=500,
+            detail="Completed AI Scan export has no file content.",
+        )
+
+    return Response(
+        content=bytes(content),
+        media_type=job.get("media_type") or "application/json",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{job["filename"]}"'
+            )
+        },
+    )

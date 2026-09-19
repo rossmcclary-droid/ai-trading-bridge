@@ -1,0 +1,129 @@
+name: Bridge Challenge one-shot benchmark
+
+on:
+  push:
+    branches:
+      - bridge-replit-live-snapshot-001
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bridge-challenge-benchmark
+  cancel-in-progress: false
+
+jobs:
+  offline-validation:
+    if: contains(github.event.head_commit.message, '[bridge-benchmark-one-shot]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify accepted lineage and source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor fcba5a6383f191668c3ad31eee8999b3d495b9eb HEAD
+          sha256sum --check <<'EOF'
+          685ba84f5e13b7a24433c1bbc71357954050d1e210aaa02d49738970c68c8da3  artifacts/api-server/app/routes/exports.py
+          13af54eae8e52ff92ba4eed583647cf27b7ddcffd625ece5e1699091486a4785  artifacts/api-server/app/services/export_timings.py
+          5a587c78bbd54dcf4f84a596791fba434012267af757bf3bb61ffc67ecfae469  artifacts/api-server/app/services/scanner.py
+          acc1dfc4fbc982602abaab0764145c3d3a91775b984f53b5d877ecc7c657015b  artifacts/api-server/app/services/rate_limit.py
+          97f32d90ab97f6731d3e7e1926a49b79efac71287a2984fe70913f24857c437a  artifacts/api-server/tests/test_prebenchmark_safety.py
+          EOF
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: artifacts/api-server/requirements.txt
+
+      - name: Install API dependencies
+        run: python -m pip install --disable-pip-version-check -r artifacts/api-server/requirements.txt
+
+      - name: Compile backend
+        run: python -m compileall -q artifacts/api-server/app scripts/bridge_challenge_benchmark.py
+
+      - name: Run the 14 pre-benchmark safety tests
+        working-directory: artifacts/api-server
+        run: PYTHONPATH=. python -m unittest discover -s tests -p test_prebenchmark_safety.py -v
+
+  benchmark:
+    needs: offline-validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    environment: bridge-benchmark
+    env:
+      TRADELOCKER_DEMO_BASE_URL: https://demo.tradelocker.com/backend-api
+      TRADELOCKER_DEMO_EMAIL: ${{ secrets.TRADELOCKER_DEMO_EMAIL }}
+      TRADELOCKER_DEMO_PASSWORD: ${{ secrets.TRADELOCKER_DEMO_PASSWORD }}
+      TRADELOCKER_DEMO_SERVER: ${{ secrets.TRADELOCKER_DEMO_SERVER }}
+      TRADELOCKER_DEVELOPER_API_KEY: ${{ secrets.TRADELOCKER_DEVELOPER_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: artifacts/api-server/requirements.txt
+
+      - name: Install API dependencies
+        run: python -m pip install --disable-pip-version-check -r artifacts/api-server/requirements.txt
+
+      - name: Initialize sanitized evidence
+        env:
+          BRIDGE_EVIDENCE_PATH: ${{ runner.temp }}/bridge-benchmark-evidence.json
+        shell: bash
+        run: |
+          printf '%s\n' '{"schema":"bridge.challenge-benchmark.summary.v1","status":"PRE_PROVIDER_GATE","start_post_count":0,"raw_payload_preserved":false}' > "$BRIDGE_EVIDENCE_PATH"
+
+      - name: Fail closed unless required TradeLocker secrets exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in TRADELOCKER_DEMO_EMAIL TRADELOCKER_DEMO_PASSWORD TRADELOCKER_DEMO_SERVER; do
+            if [ -z "${!name:-}" ]; then
+              echo "Required secure configuration is absent: ${name}"
+              exit 1
+            fi
+          done
+
+      - name: Start local read-only API
+        working-directory: artifacts/api-server
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m uvicorn app.main:app --host 127.0.0.1 --port 8765 > "$RUNNER_TEMP/bridge-api.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/bridge-api.pid"
+
+      - name: Run exactly one Challenge export
+        env:
+          BRIDGE_BASE_URL: http://127.0.0.1:8765
+          BRIDGE_EVIDENCE_PATH: ${{ runner.temp }}/bridge-benchmark-evidence.json
+          BRIDGE_EXPECTED_SHA: fcba5a6383f191668c3ad31eee8999b3d495b9eb
+        run: python scripts/bridge_challenge_benchmark.py
+
+      - name: Stop local API
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/bridge-api.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/bridge-api.pid")" 2>/dev/null || true
+          fi
+
+      - name: Upload sanitized benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-challenge-benchmark-${{ github.run_id }}
+          path: ${{ runner.temp }}/bridge-benchmark-evidence.json
+          if-no-files-found: error
+          retention-days: 3

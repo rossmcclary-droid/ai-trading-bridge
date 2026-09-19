@@ -7,6 +7,11 @@ from app.connectors.tradelocker import (
     TradeLockerConfig,
     TradeLockerConnector,
 )
+from app.services.rate_limit import (
+    RateLimitError,
+    gather_rate_limit_aware,
+    is_rate_limited,
+)
 
 
 TIMEFRAMES = ("4H", "1H", "15M", "5M")
@@ -33,17 +38,24 @@ async def _history_with_retry(
             try:
                 result=await connector.get_historical_candles(**kwargs)
             finally:
-                if timing is not None: timing["history_network_ms"]=timing.get("history_network_ms",0.0)+(time.perf_counter()-_t)*1000.0
+                elapsed_ms = (time.perf_counter()-_t)*1000.0
+                if timing is not None: timing["history_network_ms"]=timing.get("history_network_ms",0.0)+elapsed_ms
+                if request_timing is not None: request_timing["history_network_ms"]=request_timing.get("history_network_ms",0.0)+elapsed_ms
             return result
         except Exception as error:
             last_error = error
+
+            if is_rate_limited(error):
+                raise RateLimitError(str(error)) from error
 
             if attempt == attempts - 1:
                 raise
 
             _t=time.perf_counter()
-        await asyncio.sleep(3 * (attempt + 1))
-        if timing is not None: timing["history_delay_sleep_ms"]=timing.get("history_delay_sleep_ms",0.0)+(time.perf_counter()-_t)*1000.0
+            await asyncio.sleep(3 * (attempt + 1))
+            elapsed_ms = (time.perf_counter()-_t)*1000.0
+            if timing is not None: timing["history_delay_sleep_ms"]=timing.get("history_delay_sleep_ms",0.0)+elapsed_ms
+            if request_timing is not None: request_timing["history_delay_sleep_ms"]=request_timing.get("history_delay_sleep_ms",0.0)+elapsed_ms
 
     raise last_error
 
@@ -122,7 +134,6 @@ class ScannerService:
         candles: dict[str, Any] = {}
 
         for timeframe in TIMEFRAMES:
-            _processing_started=time.perf_counter()
             candles[timeframe] = (
                 await self.connector.get_historical_candles(
                     account_id=account_id,
@@ -142,7 +153,6 @@ class ScannerService:
             "tradable_instrument_id": tradable_id,
             "route_id": route_id,
             "timeframes": candles,
-            "_patch002c_timing": _symbol_timing,
         }
 
 
@@ -154,7 +164,7 @@ class ScannerService:
         acc_num: str,
         broker_crypto_only: bool = False,
         history_request_delay_seconds: float | None = None,
-    timing: dict[str, Any] | None = None,
+        timing: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Collect multi-timeframe data while respecting broker rate limits."""
 
@@ -213,11 +223,13 @@ class ScannerService:
         results: dict[str, Any] = {}
         errors: dict[str, str] = {}
 
-        history_semaphore = asyncio.Semaphore(3)
-
-    async def _scan_symbol(symbol: str) -> None:
-        async with history_semaphore:
+        async def _scan_symbol(symbol: str) -> None:
                 normalized = symbol.upper()
+                symbol_timing = {
+                    "history_network_ms": 0.0,
+                    "history_delay_sleep_ms": 0.0,
+                    "history_success_delay_sleep_ms": 0.0,
+                }
 
                 try:
                     instrument = instrument_map.get(normalized)
@@ -247,38 +259,47 @@ class ScannerService:
                     candles: dict[str, Any] = {}
 
                     for timeframe in TIMEFRAMES:
-                        request_timing = {"timeframe": timeframe, "attempts": 0, "retry_count": 0, "history_network_ms": 0.0, "history_delay_sleep_ms": 0.0}
+                        request_timing = {"timeframe": timeframe, "attempts": 0, "retry_count": 0, "history_network_ms": 0.0, "history_delay_sleep_ms": 0.0, "history_success_delay_sleep_ms": 0.0}
                         _request_started = time.perf_counter()
-                        candles[timeframe] = (
-                            await _history_with_retry(
-                                self.connector,
-                                account_id=account_id,
-                                acc_num=acc_num,
-                                tradable_instrument_id=tradable_id,
-                                route_id=route_id,
-                                resolution=timeframe,
-                                from_timestamp=now - lookbacks[timeframe],
-                                to_timestamp=now,
-                                timing=timing,
-                                request_timing=request_timing,
+                        try:
+                            candles[timeframe] = (
+                                await _history_with_retry(
+                                    self.connector,
+                                    account_id=account_id,
+                                    acc_num=acc_num,
+                                    tradable_instrument_id=tradable_id,
+                                    route_id=route_id,
+                                    resolution=timeframe,
+                                    from_timestamp=now - lookbacks[timeframe],
+                                    to_timestamp=now,
+                                    timing=symbol_timing,
+                                    request_timing=request_timing,
+                                )
                             )
-                        )
-                        _request_ended = time.perf_counter()
-                        request_timing.update(started_at_ms=round(_request_started * 1000.0, 3), ended_at_ms=round(_request_ended * 1000.0, 3), elapsed_ms=round((_request_ended - _request_started) * 1000.0, 3))
-                        if timing is not None:
-                            timing.setdefault("history_request_trace", []).append(request_timing)
+                            request_timing["outcome"] = "success"
 
-            # Avoid bursting TradeLocker's history endpoint.
-                        delay_seconds = (
-                            history_request_delay_seconds
-                            if history_request_delay_seconds is not None
-                            else (2.0 if broker_crypto_only else 1.0)
-                        )
-                        delay_elapsed_ms = 0.0
-                        if delay_seconds > 0:
-                            delay_started = time.perf_counter()
-                            await asyncio.sleep(delay_seconds)
-                            delay_elapsed_ms = (time.perf_counter() - delay_started) * 1000.0
+                            # Avoid bursting TradeLocker's history endpoint.
+                            delay_seconds = (
+                                history_request_delay_seconds
+                                if history_request_delay_seconds is not None
+                                else (2.0 if broker_crypto_only else 1.0)
+                            )
+                            if delay_seconds > 0:
+                                delay_started = time.perf_counter()
+                                await asyncio.sleep(delay_seconds)
+                                delay_elapsed_ms = (time.perf_counter() - delay_started) * 1000.0
+                                symbol_timing["history_delay_sleep_ms"] += delay_elapsed_ms
+                                symbol_timing["history_success_delay_sleep_ms"] += delay_elapsed_ms
+                                request_timing["history_delay_sleep_ms"] += delay_elapsed_ms
+                                request_timing["history_success_delay_sleep_ms"] += delay_elapsed_ms
+                        except Exception:
+                            request_timing["outcome"] = "failure"
+                            raise
+                        finally:
+                            _request_ended = time.perf_counter()
+                            request_timing.update(started_at_ms=round(_request_started * 1000.0, 3), ended_at_ms=round(_request_ended * 1000.0, 3), elapsed_ms=round((_request_ended - _request_started) * 1000.0, 3))
+                            if timing is not None:
+                                timing.setdefault("history_request_trace", []).append(request_timing)
                     results[normalized] = {
                         "symbol": normalized,
                         "account_id": account_id,
@@ -286,33 +307,33 @@ class ScannerService:
                         "tradable_instrument_id": tradable_id,
                         "route_id": route_id,
                         "timeframes": candles,
+                        "_patch002c_timing": {
+                            key: round(value, 3)
+                            for key, value in symbol_timing.items()
+                        },
                     }
-
-                    symbol_timing = results[normalized].get("patch002c_timing")
-                    if isinstance(symbol_timing, dict) and delay_elapsed_ms > 0:
-                        symbol_timing["history_delay_sleep_ms"] = round(
-                            float(symbol_timing.get("history_delay_sleep_ms", 0.0))
-                            + delay_elapsed_ms,
-                            3,
-                        )
-                        symbol_timing["history_success_delay_sleep_ms"] = round(
-                            float(symbol_timing.get("history_success_delay_sleep_ms", 0.0))
-                            + delay_elapsed_ms,
-                            3,
-                        )
-            
                 except Exception as error:
+                    if is_rate_limited(error):
+                        raise RateLimitError(str(error)) from error
                     errors[normalized] = str(error)
 
                     # Give the broker extra recovery time after a failure.
                     await asyncio.sleep(1.0)
+                finally:
+                    if timing is not None:
+                        for key in (
+                            "history_network_ms",
+                            "history_delay_sleep_ms",
+                            "history_success_delay_sleep_ms",
+                        ):
+                            timing[key] = timing.get(key, 0.0) + symbol_timing[key]
 
-        await asyncio.gather(*(_scan_symbol(symbol) for symbol in symbols))
+        await gather_rate_limit_aware(symbols, _scan_symbol, concurrency=3)
 
         return {
-                "results": results,
-                "errors": errors,
-                "requested": len(symbols),
-                "successful": len(results),
-                "failed": len(errors),
-            }
+            "results": results,
+            "errors": errors,
+            "requested": len(symbols),
+            "successful": len(results),
+            "failed": len(errors),
+        }

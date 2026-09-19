@@ -26,6 +26,11 @@ from app.account_manager import AccountManager
 from app.services import export_job_store
 from app.services.analysis import analyze_scan
 from app.services.scanner import ScannerService
+from app.services.rate_limit import (
+    RateLimitError,
+    gather_rate_limit_aware,
+    is_rate_limited,
+)
 from app.services.market_session import default_tradable_symbols, weekend_crypto_only
 from app.services.broker_cache import (
     get_cached,
@@ -244,15 +249,13 @@ async def _export_retry(callable_obj, *args, **kwargs):
 
         except Exception as error:
             last_error = error
-            message = str(error)
+            if is_rate_limited(error):
+                raise RateLimitError(str(error)) from error
 
             if attempt >= 2:
                 break
 
-            if "HTTP 429" in message or "rate_limited" in message:
-                await asyncio.sleep(4.0 * (attempt + 1))
-            else:
-                await asyncio.sleep(1.5 * (attempt + 1))
+            await asyncio.sleep(1.5 * (attempt + 1))
 
     if last_error is not None:
         raise last_error
@@ -1003,15 +1006,13 @@ async def export_ai_scan(
                 eligible
             )
 
-            _quote_semaphore = _asyncio.Semaphore(6)
             _quote_task_elapsed_ms: list[float] = []
     
             async def _discover_quote(candidate):
                 symbol_name = candidate["symbol"]
                 category = candidate["category"]
 
-                async with _quote_semaphore:
-                    try:
+                try:
                         resolved = resolve_tradelocker_instrument(
                             shared_instrument_metadata,
                             symbol_name,
@@ -1118,15 +1119,17 @@ async def export_ai_scan(
                             "quote_available": True,
                         }
 
-                    except Exception as error:
-                        return {
-                            "symbol": symbol_name,
-                            "category": category,
-                            "quote_available": False,
-                            "error": (
-                                f"{type(error).__name__}: {error}"
-                            ),
-                        }
+                except Exception as error:
+                    if is_rate_limited(error):
+                        raise RateLimitError(str(error)) from error
+                    return {
+                        "symbol": symbol_name,
+                        "category": category,
+                        "quote_available": False,
+                        "error": (
+                            f"{type(error).__name__}: {error}"
+                        ),
+                    }
 
             _quote_task_elapsed_ms.clear()
             async def _timed_discover_quote(candidate):
@@ -1137,12 +1140,12 @@ async def export_ai_scan(
                     _quote_task_elapsed_ms.append(round((time.perf_counter()-task_started)*1000,3))
 
             _q0=time.perf_counter()
-            discovery_results = await _asyncio.gather(
-                *[
-                    _timed_discover_quote(candidate)
-                    for candidate in eligible
-                ]
+            discovery_results = await gather_rate_limit_aware(
+                eligible,
+                _timed_discover_quote,
+                concurrency=6,
             )
+            discovery_results = [item for item in discovery_results if item is not None]
             _quote_stats["gather_wall_ms"] = round((time.perf_counter()-_q0)*1000,3)
             _quote_stats["task_elapsed_ms"] = list(_quote_task_elapsed_ms)
             _patch002c_quote_gather = {"n_tasks": _quote_stats["n_tasks"], "gather_wall_ms": _quote_stats["gather_wall_ms"], "task_elapsed_ms": list(_quote_task_elapsed_ms)}
@@ -1445,7 +1448,7 @@ async def export_ai_scan(
 
     scanner = ScannerService()
 
-    _scanner_timing={"history_network_ms":0.0,"history_delay_sleep_ms":0.0}
+    _scanner_timing={"history_network_ms":0.0,"history_delay_sleep_ms":0.0,"history_success_delay_sleep_ms":0.0}
     batch = await scanner.scan_symbols(
         symbols=requested_symbols,
         account_id=int(account.external_account_id),
@@ -1456,6 +1459,12 @@ async def export_ai_scan(
         history_request_delay_seconds=0.0,
         timing=_scanner_timing,
     )
+    _patch002d_history = {
+        "history_network_ms": round(float(_scanner_timing["history_network_ms"]), 3),
+        "history_delay_sleep_ms": round(float(_scanner_timing["history_delay_sleep_ms"]), 3),
+        "history_success_delay_sleep_ms": round(float(_scanner_timing["history_success_delay_sleep_ms"]), 3),
+        "history_processing_ms": None,
+    }
 
     exported_instruments = []
 

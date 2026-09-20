@@ -787,6 +787,10 @@ async def export_ai_scan(
     shared_connector = TradeLockerConnector()
     shared_instrument_metadata = None
     shared_instrument_metadata_error = None
+    # Initialize every discovery clock before the first provider-capable
+    # operation.  An acquisition failure must never be replaced by an
+    # unbound timing-local exception during fallback/finalization.
+    _ss0 = time.perf_counter()
 
     _u0=time.perf_counter()
     try:
@@ -798,9 +802,22 @@ async def export_ai_scan(
         )
         _discovery_substage_ms["universe_instrument_acquisition_ms"]=round((time.perf_counter()-_u0)*1000,3)
     except Exception as error:
-        shared_instrument_metadata_error = (
-            f"{type(error).__name__}: {error}"
-        )
+        # Instrument metadata is the canonical prerequisite for discovery and
+        # for the deep scanner.  Do not fall through to defaults and perform a
+        # second authentication/provider sequence when this boundary fails.
+        # The wrapper deliberately contains no provider response or secret
+        # material; sanitize_failure recovers HTTP status from the cause.
+        if is_rate_limited(error):
+            acquisition_error = RateLimitError(
+                "TradeLocker instrument acquisition was rate limited."
+            )
+        else:
+            acquisition_error = RuntimeError(
+                "TradeLocker instrument acquisition failed."
+            )
+        acquisition_error.failure_stage = "instrument_discovery"
+        acquisition_error.provider_operation = "instruments"
+        raise acquisition_error from error
 
     _finish_stage("stage_1_account_and_connector")
 

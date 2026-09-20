@@ -7,10 +7,11 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from urllib.error import HTTPError
 
 from app.services.failure_telemetry import sanitize_failure
+from app.services.rate_limit import RateLimitError
 
 
 ROOT = Path(__file__).parents[3]
@@ -26,6 +27,72 @@ def load_harness():
 
 
 class SanitizedFailureTelemetryTests(unittest.TestCase):
+    def test_early_instrument_failure_keeps_taxonomy_and_stops_downstream(self):
+        from app.routes import exports
+
+        original = RuntimeError("opaque injected acquisition failure")
+
+        async def exercise():
+            with patch.object(
+                exports.TradeLockerConnector,
+                "get_available_instruments",
+                new=AsyncMock(side_effect=original),
+            ) as acquisition, patch.object(
+                exports.TradeLockerConnector,
+                "get_quotes",
+                new=AsyncMock(),
+            ) as quotes, patch.object(exports, "ScannerService") as scanner:
+                with self.assertRaises(RuntimeError) as raised:
+                    await exports.export_ai_scan(
+                        nickname="Challenge",
+                        symbols=None,
+                    )
+                acquisition.assert_awaited_once()
+                quotes.assert_not_awaited()
+                scanner.assert_not_called()
+                return raised.exception
+
+        error = asyncio.run(exercise())
+        self.assertNotIsInstance(error, UnboundLocalError)
+        result = sanitize_failure(error)
+        self.assertEqual(result["error_type"], "RuntimeError")
+        self.assertEqual(result["failure_stage"], "instrument_discovery")
+        self.assertEqual(result["provider_operation"], "instruments")
+        self.assertFalse(result["rate_limited"])
+
+    def test_early_instrument_429_propagates_once_and_stops_downstream(self):
+        from app.routes import exports
+
+        original = RuntimeError("opaque")
+        original.status_code = 429
+
+        async def exercise():
+            with patch.object(
+                exports.TradeLockerConnector,
+                "get_available_instruments",
+                new=AsyncMock(side_effect=original),
+            ) as acquisition, patch.object(
+                exports.TradeLockerConnector,
+                "get_quotes",
+                new=AsyncMock(),
+            ) as quotes, patch.object(exports, "ScannerService") as scanner:
+                with self.assertRaises(RateLimitError) as raised:
+                    await exports.export_ai_scan(
+                        nickname="Challenge",
+                        symbols=None,
+                    )
+                acquisition.assert_awaited_once()
+                quotes.assert_not_awaited()
+                scanner.assert_not_called()
+                return raised.exception
+
+        error = asyncio.run(exercise())
+        result = sanitize_failure(error)
+        self.assertEqual(result["failure_stage"], "instrument_discovery")
+        self.assertEqual(result["provider_operation"], "instruments")
+        self.assertEqual(result["provider_http_status"], 429)
+        self.assertTrue(result["rate_limited"])
+
     def test_adversarial_exception_never_preserves_secret_material(self):
         secret_values = [
             "person@example.com", "p@ssword-123", "demo-server-secret",

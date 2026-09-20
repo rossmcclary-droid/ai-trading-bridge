@@ -28,14 +28,14 @@ jobs:
           set -euo pipefail
           git merge-base --is-ancestor fcba5a6383f191668c3ad31eee8999b3d495b9eb HEAD
           sha256sum --check <<'EOF'
-          54c28ee705d45c1d7654b87c4508e36ab1768e4716af5d7b71d071f283fbd3a8  artifacts/api-server/app/routes/exports.py
+          2ee5c28e4c7ca02849e5abec503a7423b9cc273dcdff7330947522af22830a6f  artifacts/api-server/app/routes/exports.py
           13af54eae8e52ff92ba4eed583647cf27b7ddcffd625ece5e1699091486a4785  artifacts/api-server/app/services/export_timings.py
           5a587c78bbd54dcf4f84a596791fba434012267af757bf3bb61ffc67ecfae469  artifacts/api-server/app/services/scanner.py
           acc1dfc4fbc982602abaab0764145c3d3a91775b984f53b5d877ecc7c657015b  artifacts/api-server/app/services/rate_limit.py
           97f32d90ab97f6731d3e7e1926a49b79efac71287a2984fe70913f24857c437a  artifacts/api-server/tests/test_prebenchmark_safety.py
           d7474466bb8d3512d4859d6d9a8355f015f2a630fde227c45267d982000c4829  artifacts/api-server/app/services/failure_telemetry.py
           5322d554e3a665ba0cdbba8dc3511c84488fbd345a35a299d69878161f3cb1cf  artifacts/api-server/app/services/export_job_store.py
-          ce6fb9e362f3cc18deeaef3b6cb027e3dbc4d5a09875c90897fdad8ddfbf1fbb  artifacts/api-server/tests/test_sanitized_failure_telemetry.py
+          32a48cfb2a53337c4f5498c6e49ca9cfa2223dc61160ded2f4266bb02c94df7a  artifacts/api-server/tests/test_sanitized_failure_telemetry.py
           6aa7975eac8af2c221faa0e8ddf6d3e60770a44f2782a03ca5ad46f9b7f895ce  scripts/bridge_challenge_benchmark.py
           EOF
 

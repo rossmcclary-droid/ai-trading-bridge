@@ -4018,11 +4018,11 @@ async def _run_ai_scan_export_job(
         job["export_ai_scan_total_ms"] = round((_export_finished_perf - _wrapper_call_started) * 1000, 3)
         _post_export_prepare_started = time.perf_counter()
         _job_payload = None
+        _payload_assembly_started = time.perf_counter()
         try:
             _job_payload = json.loads(response.body.decode("utf-8"))
             _job_diag = _job_payload.setdefault("diagnostics", {}).setdefault("patch002b_timings", {})
             _job_diag.update({k: v for k, v in job.items() if k.endswith("_ms") or k == "async_schedule_wait_ms"})
-            _payload_assembly_started = time.perf_counter()
             _job_content = json.dumps(_job_payload, indent=2, ensure_ascii=False).encode("utf-8")
         except Exception:
             _job_content = bytes(response.body)
@@ -4048,8 +4048,9 @@ async def _run_ai_scan_export_job(
         _state_finalization_started = time.perf_counter()
         _patch002dj_clock["logical_complete"] = _state_finalization_started
         # Stamp ready_visible after the READY record is durably saved.
-        diagnostics = _job_payload.setdefault("diagnostics", {})
-        diagnostics["patch002dj_timings"] = build_patch002dj(job, export_payload=diagnostics.get("patch002dj_timings_ms", diagnostics.get("patch002_timings_ms", diagnostics.get("_timings_ms", diagnostics.get("timing_ms", {})))))
+        if _job_payload is not None:
+            diagnostics = _job_payload.setdefault("diagnostics", {})
+            diagnostics["patch002dj_timings"] = build_patch002dj(job, export_payload=diagnostics.get("patch002dj_timings_ms", diagnostics.get("patch002_timings_ms", diagnostics.get("_timings_ms", diagnostics.get("timing_ms", {})))))
         job.update(
             {
                 "status": "READY",
@@ -4078,10 +4079,13 @@ async def _run_ai_scan_export_job(
             _job_diag["patch002dj_timings"] = build_patch002dj(job, export_payload=_job_payload)
 
     except Exception as exc:
+        from app.services.failure_telemetry import sanitize_failure
+
         job.update(
             {
                 "status": "FAILED",
-                "error": str(exc),
+                "error": "AI_SCAN_EXPORT_FAILED",
+                **sanitize_failure(exc),
                 "completed_at": datetime.now(
                     timezone.utc
                 ).isoformat(),
@@ -4160,7 +4164,7 @@ async def get_ai_scan_export_job(
             detail="AI Scan export job not found.",
         )
 
-    return {
+    response = {
         "job_id": job["job_id"],
         "nickname": job["nickname"],
         "status": job["status"],
@@ -4169,6 +4173,19 @@ async def get_ai_scan_export_job(
         "filename": job["filename"],
         "error": job["error"],
     }
+    if job["status"] == "FAILED":
+        response.update(
+            {
+                "error_type": job.get("error_type"),
+                "failure_stage": job.get("failure_stage"),
+                "provider_http_status": job.get("provider_http_status"),
+                "provider_operation": job.get("provider_operation"),
+                "rate_limited": job.get("rate_limited", False),
+                "retry_after_present": job.get("retry_after_present", False),
+                "retry_after_seconds": job.get("retry_after_seconds"),
+            }
+        )
+    return response
 
 
 @router.get("/scan/export-ai/jobs/{job_id}/download")

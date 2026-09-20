@@ -34,6 +34,19 @@ def _looks_rate_limited(value: Any) -> bool:
     return bool(re.search(r"(?:http\s*)?429(?!\d)|too many requests|rate.?limit", text))
 
 
+_FAILURE_FIELDS = {
+    "error_type", "failure_stage", "provider_http_status", "provider_operation",
+    "rate_limited", "retry_after_present", "retry_after_seconds",
+}
+
+
+def _copy_failure_telemetry(source: dict[str, Any], evidence: dict[str, Any]) -> None:
+    """Copy only the backend's fixed non-secret failure taxonomy."""
+    for key in _FAILURE_FIELDS:
+        if key in source:
+            evidence[key] = source[key]
+
+
 def _number(value: Any) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return round(float(value), 3)
@@ -163,10 +176,10 @@ def main() -> int:
 
         evidence["status"] = str(terminal.get("status"))
         if terminal.get("status") == "FAILED":
-            evidence["rate_limited"] = _looks_rate_limited(terminal.get("error"))
+            _copy_failure_telemetry(terminal, evidence)
             evidence["failure_category"] = (
                 "provider_rate_limited"
-                if evidence["rate_limited"]
+                if evidence.get("rate_limited") is True
                 else "export_failed"
             )
             save()

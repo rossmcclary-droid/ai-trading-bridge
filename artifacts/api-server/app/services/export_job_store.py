@@ -124,6 +124,13 @@ def reconcile_orphans(live_job_ids: Iterable[str] = ()) -> list[str]:
             if job.get("status") == "BUILDING" and job_id not in live:
                 job["status"] = "FAILED"
                 job["error"] = "WORKER_RESTARTED_BEFORE_COMPLETION"
+                job["error_type"] = "RuntimeError"
+                job["failure_stage"] = "application"
+                job["provider_http_status"] = None
+                job["provider_operation"] = "application"
+                job["rate_limited"] = False
+                job["retry_after_present"] = False
+                job["retry_after_seconds"] = None
                 job["completed_at"] = now
                 job["updated_at"] = now
                 interrupted.append(job_id)
